@@ -91,7 +91,7 @@ const VOICE_MODELS_DIR = path.join(app.getPath('userData'), 'voice')
 const VOICE_DEV_DIR = path.join(__dirname, '..', 'rdr_voice')
 
 const VOICE_MANIFEST = {
-  baseUrl: 'https://github.com/red-dirt-rhythm/voice-models/releases/download/v1.0.0',
+  baseUrl: 'https://github.com/RJF-72/improved-palm-tree/releases/download/v1.0.0',
   files: [
     { name: 'infer_voice.py', size: 0 },
     { name: 'male/logs/44k/config.json', size: 0 },
@@ -213,6 +213,107 @@ ipcMain.handle('voice-download', async (event) => {
   return { success, dir: VOICE_MODELS_DIR }
 })
 
+// ── Instrument Library Management ──
+const INSTRUMENTS_DIR = path.join(app.getPath('userData'), 'instruments')
+const INSTRUMENTS_DEV_DIR = path.join(__dirname, 'All Instruments')
+const INSTRUMENTS_ZIP_URL = 'https://drive.google.com/uc?export=download&id=16iBbDIxvI3bqjCW-fqLEvLwzoj5rKQRN'
+
+function ensureInstrumentsDir() {
+  if (!fs.existsSync(INSTRUMENTS_DIR)) fs.mkdirSync(INSTRUMENTS_DIR, { recursive: true })
+}
+
+function checkInstrumentsExist() {
+  const playableDir = path.join(INSTRUMENTS_DIR, 'Playable RealTracks_1_1_1')
+  if (!fs.existsSync(playableDir)) return false
+  const entries = fs.readdirSync(playableDir)
+  return entries.length > 10
+}
+
+function copyInstrumentsFromDev(destDir, event) {
+  ensureInstrumentsDir()
+  const srcDir = path.join(INSTRUMENTS_DEV_DIR, 'Playable RealTracks_1_1_1')
+  if (!fs.existsSync(srcDir)) return false
+
+  const destPlayable = path.join(destDir, 'Playable RealTracks_1_1_1')
+  if (!fs.existsSync(destPlayable)) fs.mkdirSync(destPlayable, { recursive: true })
+
+  const files = []
+  function collectFiles(dir, rel) {
+    for (const entry of fs.readdirSync(dir)) {
+      const full = path.join(dir, entry)
+      const stat = fs.statSync(full)
+      if (stat.isDirectory()) {
+        collectFiles(full, path.join(rel, entry))
+      } else {
+        files.push({ src: full, rel: path.join(rel, entry) })
+      }
+    }
+  }
+  collectFiles(srcDir, '')
+
+  let copied = 0
+  for (const file of files) {
+    const dest = path.join(destPlayable, file.rel)
+    const destPath = path.dirname(dest)
+    if (!fs.existsSync(destPath)) fs.mkdirSync(destPath, { recursive: true })
+    if (!fs.existsSync(dest)) fs.copyFileSync(file.src, dest)
+    copied++
+    if (event && copied % 50 === 0) {
+      event.sender.send('instruments-download-progress', { current: copied, total: files.length, file: file.rel, status: 'copying' })
+    }
+  }
+  if (event) event.sender.send('instruments-download-progress', { current: copied, total: files.length, status: 'done' })
+  return checkInstrumentsExist()
+}
+
+async function downloadAndExtractInstruments(event) {
+  ensureInstrumentsDir()
+  const zipPath = path.join(INSTRUMENTS_DIR, 'instruments.zip')
+
+  if (event) event.sender.send('instruments-download-progress', { current: 0, total: 1, file: 'instruments.zip', status: 'downloading' })
+  try {
+    await downloadFile(INSTRUMENTS_ZIP_URL, zipPath, event)
+  } catch (err) {
+    console.error('[Instruments] Failed to download zip:', err.message)
+    if (event) event.sender.send('instruments-download-error', { error: err.message })
+    return false
+  }
+  if (event) event.sender.send('instruments-download-progress', { current: 1, total: 1, file: 'instruments.zip', status: 'extracting' })
+
+  try {
+    const SevenZip = require('7zip-bin')
+    const sevenZipPath = SevenZip.path7za
+    const extractDir = INSTRUMENTS_DIR
+    await new Promise((resolve, reject) => {
+      const proc = spawn(sevenZipPath, ['x', zipPath, `-o${extractDir}`, '-y'], { stdio: ['ignore', 'pipe', 'pipe'] })
+      proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`7z exited with code ${code}`)))
+      proc.on('error', reject)
+    })
+    fs.unlinkSync(zipPath)
+  } catch (err) {
+    console.error('[Instruments] Failed to extract zip:', err.message)
+    if (event) event.sender.send('instruments-download-error', { error: err.message })
+    return false
+  }
+
+  if (event) event.sender.send('instruments-download-progress', { current: 1, total: 1, status: 'done' })
+  return checkInstrumentsExist()
+}
+
+ipcMain.handle('instruments-check', () => {
+  return { exists: checkInstrumentsExist(), dir: INSTRUMENTS_DIR }
+})
+
+ipcMain.handle('instruments-download', async (event) => {
+  if (checkInstrumentsExist()) return { success: true, dir: INSTRUMENTS_DIR }
+  if (fs.existsSync(path.join(INSTRUMENTS_DEV_DIR, 'Playable RealTracks_1_1_1'))) {
+    const success = copyInstrumentsFromDev(INSTRUMENTS_DIR, event)
+    return { success, dir: INSTRUMENTS_DIR }
+  }
+  const success = await downloadAndExtractInstruments(event)
+  return { success, dir: INSTRUMENTS_DIR }
+})
+
 // ── TitanEngine V10 Server Management ──
 function startTitanEngine() {
   const engineScript = path.join(__dirname, '..', 'titanengine_extract', 'TitanEngine', 'WORKING_ENGINE.py')
@@ -277,6 +378,7 @@ function createWindow () {
   process.env.TITAN_ENGINE_URL = TITAN_ENGINE_URL
   process.env.TELEPROMPTER_PORT = String(TELEPROMPTER_PORT)
   process.env.VOICE_MODELS_DIR = VOICE_MODELS_DIR
+  process.env.INSTRUMENTS_DIR = INSTRUMENTS_DIR
 
   win.loadFile('index.html')
 
