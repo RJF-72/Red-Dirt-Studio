@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- Background circle -->
+  <circle cx="100" cy="100" r="95" fill="#2c1810" stroke="#d4a574" stroke-width="2"/>
+  
+  <!-- Guitar outline -->
+  <ellipse cx="100" cy="70" rx="35" ry="40" fill="none" stroke="#d4a574" stroke-width="2"/>
+  <circle cx="100" cy="70" r="15" fill="none" stroke="#d4a574" stroke-width="2"/>
+  <rect x="95" y="105" width="10" height="50" fill="#d4a574"/>
+  
+  <!-- Music notes -->
+  <g fill="#d4a574">
+    <circle cx="140" cy="50" r="3"/>
+    <path d="M 140 53 L 140 65" stroke="#d4a574" stroke-width="1" fill="none"/>
+    
+    <circle cx="155" cy="60" r="3"/>
+    <path d="M 155 63 L 155 75" stroke="#d4a574" stroke-width="1" fill="none"/>
+  </g>
+  
+  <!-- "RDR" text -->
+  <text x="100" y="155" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#d4a574" text-anchor="middle">Red Dirt</text>
+</svg>
