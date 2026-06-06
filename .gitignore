@@ -1,4 +1,17 @@
+target/
+.git/
+*.lock
+Cargo.lock
 node_modules/
+.DS_Store
+*.o
+*.so
+*.pyc
+*.wav
+*.mp3
+*.flac
+*.aiff
 dist/
-*.log
+build/
+*.nsis
 All Instruments/
