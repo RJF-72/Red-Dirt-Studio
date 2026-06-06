@@ -11,7 +11,11 @@ node_modules/
 *.mp3
 *.flac
 *.aiff
+*.m4a
 dist/
 build/
 *.nsis
 All Instruments/
+RDRS/
+rdr_voice/female/
+rdr_voice/male/
