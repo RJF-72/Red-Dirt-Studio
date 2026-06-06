@@ -1,0 +1,11 @@
+[package]
+name = "rdr_voice_native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+tch = "0.7"
+hound = "3.4"
+ndarray = "0.15"
