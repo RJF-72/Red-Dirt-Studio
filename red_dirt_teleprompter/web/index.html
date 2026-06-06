@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Red Dirt Karaoke Teleprompter</title>
+    <style>
+        :root {
+            --lyric-font-size: 48px;
+            --line-height: 1.4;
+            --highlight-color: #ffd700;
+            --highlight-shadow: rgba(255, 215, 0, 0.5);
+            --bg-color: #0a0a14;
+            --text-color: #dcdcdc;
+            --dim-color: #646496;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Arial', sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        #lyrics-container {
+            text-align: center;
+            padding: 20px;
+            max-width: 90vw;
+            width: 100%;
+        }
+
+        .song-title {
+            color: var(--dim-color);
+            font-size: clamp(16px, 2.5vw, 24px);
+            margin-bottom: 30px;
+            font-weight: normal;
+            word-break: break-word;
+        }
+
+        .lyric-line {
+            font-size: var(--lyric-font-size);
+            line-height: var(--line-height);
+            margin: 15px 0;
+            transition: all 0.2s ease;
+            min-height: calc(var(--lyric-font-size) * var(--line-height));
+        }
+
+        .lyric-word {
+            display: inline-block;
+            margin: 0 5px;
+            transition: all 0.3s ease;
+        }
+
+        .highlighted {
+            color: var(--highlight-color);
+            font-weight: bold;
+            transform: scale(1.1);
+            text-shadow: 0 0 10px var(--highlight-shadow);
+        }
+
+        .performance-metrics {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(20, 20, 30, 0.8);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .progress-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 5px;
+            background: #333;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #ffd700, #ffaa00);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .connection-status {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .connected {
+            background: rgba(0, 200, 0, 0.2);
+            color: #0f0;
+        }
+
+        .disconnected {
+            background: rgba(200, 0, 0, 0.2);
+            color: #f00;
+        }
+
+        .demo-badge {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 11px;
+            background: rgba(255, 215, 0, 0.15);
+            color: var(--highlight-color);
+            border: 1px solid rgba(255, 215, 0, 0.3);
+            display: none;
+        }
+
+        .demo-badge.visible { display: block; }
+
+        @media (max-width: 768px) {
+            .lyric-line { font-size: clamp(24px, 6vw, 32px); }
+            .performance-metrics { font-size: 12px; bottom: 12px; left: 12px; }
+            .connection-status { top: 12px; right: 12px; font-size: 10px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="lyrics-container">
+        <div class="song-title" id="song-title">Song Title</div>
+        <div class="lyric-line" id="current-line">Current lyrics will appear here</div>
+        <div class="lyric-line" id="next-line">Next line preview</div>
+    </div>
+
+    <div class="performance-metrics" id="performance-metrics">
+        <div>Timing: <span id="timing-score">0%</span></div>
+        <div>Pitch: <span id="pitch-score">0%</span></div>
+        <div>Words: <span id="word-score">0%</span></div>
+    </div>
+
+    <div class="connection-status disconnected" id="connection-status">
+        Disconnected
+    </div>
+
+    <div class="demo-badge" id="demo-badge">
+        Demo Mode — Space to pause / resume
+    </div>
+
+    <div class="progress-bar">
+        <div class="progress-fill" id="progress-fill"></div>
+    </div>
+
+    <script>
+        class KaraokeTeleprompterClient {
+            constructor() {
+                this.ws = null;
+                this.isConnected = false;
+                this.reconnectTimer = null;
+                this.demoTimer = null;
+                this.demoRunning = false;
+                this.demoPaused = false;
+                this.demoTime = 0;
+                this.currentPosition = { time_ms: 0, current_line: 0, current_word: 0, progress: 0 };
+                this.lyrics = [];
+
+                this.connect();
+                this.setupEventListeners();
+                this.startDemoFallback();
+            }
+
+            connect() {
+                if (this.reconnectTimer) {
+                    clearTimeout(this.reconnectTimer);
+                    this.reconnectTimer = null;
+                }
+
+                const wsUrl = `ws://${window.location.hostname}:8080`;
+                try {
+                    this.ws = new WebSocket(wsUrl);
+                } catch (e) {
+                    console.error('WebSocket creation failed:', e);
+                    this.scheduleReconnect();
+                    return;
+                }
+
+                this.ws.onopen = () => {
+                    this.isConnected = true;
+                    this.stopDemo();
+                    this.updateConnectionStatus();
+                    this.ws.send(JSON.stringify({
+                        type: 'SetClientType',
+                        client_type: 'WebBrowser'
+                    }));
+                };
+
+                this.ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        this.handleUpdate(data);
+                    } catch (e) {
+                        console.error('Error parsing WebSocket message:', e);
+                    }
+                };
+
+                this.ws.onclose = () => {
+                    this.isConnected = false;
+                    this.updateConnectionStatus();
+                    this.scheduleReconnect();
+                };
+
+                this.ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    // Do not close here; let onclose handle cleanup/reconnect.
+                };
+            }
+
+            scheduleReconnect() {
+                if (this.reconnectTimer) return;
+                this.reconnectTimer = setTimeout(() => {
+                    this.reconnectTimer = null;
+                    this.connect();
+                }, 3000);
+            }
+
+            handleUpdate(data) {
+                if (data.position) {
+                    this.currentPosition = data.position;
+                }
+                if (data.lyrics) {
+                    this.lyrics = data.lyrics;
+                }
+                if (data.song_title) {
+                    document.getElementById('song-title').textContent = data.song_title;
+                }
+                if (data.highlighted_words) {
+                    this.renderLyrics(data.highlighted_words);
+                }
+                if (data.performance_metrics) {
+                    this.updatePerformanceMetrics(data.performance_metrics);
+                }
+                if (data.progress !== undefined) {
+                    this.updateProgress(data.progress);
+                }
+            }
+
+            renderLyrics(highlightedWords) {
+                const currentLine = this.lyrics[this.currentPosition.current_line];
+                const nextLine = this.lyrics[this.currentPosition.current_line + 1];
+
+                const currentLineDiv = document.getElementById('current-line');
+                const nextLineDiv = document.getElementById('next-line');
+
+                if (currentLine) {
+                    currentLineDiv.innerHTML = this.renderLine(currentLine, highlightedWords);
+                } else {
+                    currentLineDiv.textContent = '';
+                }
+
+                if (nextLine) {
+                    nextLineDiv.innerHTML = this.renderLine(nextLine, []);
+                } else {
+                    nextLineDiv.textContent = '';
+                }
+            }
+
+            renderLine(line, highlightedWords) {
+                if (!line || !line.words || !line.words.length) return line ? line.text : '';
+
+                return line.words.map((word, wordIndex) => {
+                    const isHighlighted = highlightedWords.some(hw =>
+                        hw.line === line.line_number && hw.position === wordIndex
+                    );
+                    const className = isHighlighted ? 'lyric-word highlighted' : 'lyric-word';
+                    return `<span class="${className}">${this.escapeHtml(word.text)}</span>`;
+                }).join(' ');
+            }
+
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            updatePerformanceMetrics(metrics) {
+                const timing = (metrics.timing_accuracy * 100).toFixed(1);
+                const pitch = (metrics.pitch_accuracy * 100).toFixed(1);
+                const words = (metrics.word_completion * 100).toFixed(1);
+                document.getElementById('timing-score').textContent = `${timing}%`;
+                document.getElementById('pitch-score').textContent = `${pitch}%`;
+                document.getElementById('word-score').textContent = `${words}%`;
+            }
+
+            updateProgress(progress) {
+                const progressFill = document.getElementById('progress-fill');
+                progressFill.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
+            }
+
+            updateConnectionStatus() {
+                const statusDiv = document.getElementById('connection-status');
+                if (this.isConnected) {
+                    statusDiv.className = 'connection-status connected';
+                    statusDiv.textContent = 'Connected';
+                } else {
+                    statusDiv.className = 'connection-status disconnected';
+                    statusDiv.textContent = 'Disconnected';
+                }
+            }
+
+            startDemoFallback() {
+                if (this.demoRunning || this.isConnected) return;
+                this.demoRunning = true;
+                this.demoPaused = false;
+                this.demoTime = 0;
+                document.getElementById('demo-badge').classList.add('visible');
+
+                const demoLyrics = [
+                    { text: "In the studio lights we shine so bright", line_number: 0,
+                      words: [{text:"In"},{text:"the"},{text:"studio"},{text:"lights"},{text:"we"},{text:"shine"},{text:"so"},{text:"bright"}] },
+                    { text: "Creating magic through the endless night", line_number: 1,
+                      words: [{text:"Creating"},{text:"magic"},{text:"through"},{text:"the"},{text:"endless"},{text:"night"}] },
+                    { text: "Every note we play, every word we say", line_number: 2,
+                      words: [{text:"Every"},{text:"note"},{text:"we"},{text:"play,"},{text:"every"},{text:"word"},{text:"we"},{text:"say"}] },
+                    { text: "Building something real that will never fade away", line_number: 3,
+                      words: [{text:"Building"},{text:"something"},{text:"real"},{text:"that"},{text:"will"},{text:"never"},{text:"fade"},{text:"away"}] },
+                    { text: "With zero latency we collaborate", line_number: 4,
+                      words: [{text:"With"},{text:"zero"},{text:"latency"},{text:"we"},{text:"collaborate"}] },
+                    { text: "No delay, no wait, we create", line_number: 5,
+                      words: [{text:"No"},{text:"delay,"},{text:"no"},{text:"wait,"},{text:"we"},{text:"create"}] },
+                    { text: "From different places but in perfect time", line_number: 6,
+                      words: [{text:"From"},{text:"different"},{text:"places"},{text:"but"},{text:"in"},{text:"perfect"},{text:"time"}] },
+                    { text: "Our voices blend in rhythm and rhyme", line_number: 7,
+                      words: [{text:"Our"},{text:"voices"},{text:"blend"},{text:"in"},{text:"rhythm"},{text:"and"},{text:"rhyme"}] }
+                ];
+
+                this.lyrics = demoLyrics;
+                document.getElementById('song-title').textContent = 'Demo Song — Red Dirt Studio';
+                const totalDuration = 35;
+
+                this.demoTimer = setInterval(() => {
+                    if (this.demoPaused) return;
+                    this.demoTime += 0.1;
+                    const progress = Math.min(1, this.demoTime / totalDuration);
+                    this.updateProgress(progress);
+
+                    const idx = Math.min(demoLyrics.length - 1, Math.floor(progress * demoLyrics.length));
+                    this.currentPosition.current_line = idx;
+
+                    const line = demoLyrics[idx];
+                    const wordIdx = Math.min((line.words.length - 1), Math.floor((progress * demoLyrics.length - idx) * line.words.length));
+                    this.currentPosition.current_word = wordIdx;
+
+                    const highlighted = [{ line: line.line_number, position: wordIdx, intensity: 1, time_until_highlight: 0 }];
+                    this.renderLyrics(highlighted);
+
+                    this.updatePerformanceMetrics({
+                        timing_accuracy: 0.75 + Math.sin(this.demoTime) * 0.15,
+                        pitch_accuracy: 0.7 + Math.cos(this.demoTime * 0.8) * 0.2,
+                        word_completion: progress
+                    });
+
+                    if (progress >= 1) {
+                        this.demoTime = 0;
+                    }
+                }, 100);
+            }
+
+            stopDemo() {
+                this.demoRunning = false;
+                if (this.demoTimer) {
+                    clearInterval(this.demoTimer);
+                    this.demoTimer = null;
+                }
+                document.getElementById('demo-badge').classList.remove('visible');
+            }
+
+            setupEventListeners() {
+                window.addEventListener('resize', () => this.adjustFontSize());
+                this.adjustFontSize();
+
+                document.addEventListener('keydown', (e) => {
+                    if (e.code === 'Space') {
+                        e.preventDefault();
+                        if (this.isConnected) {
+                            // Could send a pause command to the server if supported
+                            this.ws.send(JSON.stringify({ type: 'TogglePause' }));
+                        } else if (this.demoRunning) {
+                            this.demoPaused = !this.demoPaused;
+                        }
+                    }
+                    if (e.code === 'ArrowRight') {
+                        if (this.isConnected) {
+                            this.ws.send(JSON.stringify({ type: 'SkipForward', amount_ms: 5000 }));
+                        } else if (this.demoRunning) {
+                            this.demoTime = Math.min(this.demoTime + 3, 35);
+                        }
+                    }
+                    if (e.code === 'ArrowLeft') {
+                        if (this.isConnected) {
+                            this.ws.send(JSON.stringify({ type: 'SkipBack', amount_ms: 5000 }));
+                        } else if (this.demoRunning) {
+                            this.demoTime = Math.max(this.demoTime - 3, 0);
+                        }
+                    }
+                });
+
+                // Visibility change — pause/resume demo and optionally notify server
+                document.addEventListener('visibilitychange', () => {
+                    if (document.hidden && this.demoRunning) {
+                        this.demoPaused = true;
+                    }
+                });
+            }
+
+            adjustFontSize() {
+                const width = window.innerWidth;
+                let fontSize = 48;
+                if (width < 768) fontSize = 32;
+                else if (width < 1024) fontSize = 40;
+                else if (width < 1440) fontSize = 56;
+                else fontSize = 72;
+                document.documentElement.style.setProperty('--lyric-font-size', fontSize + 'px');
+            }
+        }
+
+        window.addEventListener('load', () => {
+            new KaraokeTeleprompterClient();
+        });
+    </script>
+</body>
+</html>

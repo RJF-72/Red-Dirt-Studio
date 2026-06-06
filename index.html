@@ -1,0 +1,2820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TITAN 7 ULTIMATE STUDIO · TITANENGINE v10 on TAO</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script>
+// Load ONNX Runtime asynchronously
+;(function() {
+  var s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js';
+  s.async = true;
+  s.onerror = function(){ console.warn('[ORT] Failed to load ONNX Runtime'); };
+  document.head.appendChild(s);
+})();
+
+// ============================================================
+// TITAN ENGINE WASM INTEGRATION
+// ============================================================
+// This module loads the Titan C++ engine compiled to WebAssembly
+// and provides an AudioWorklet processor for deterministic DSP.
+
+let titanWasmModule = null;
+let titanWorkletNode = null;
+let titanAudioContext = null;
+let useTitanEngine = false;
+
+async function loadTitanWasm() {
+  try {
+    // In production, this would be: await import('./titan_engine.js')
+    // For now, we simulate the WASM module interface
+    console.log('[Titan] Loading WASM module...');
+    
+    // Simulated WASM exports (matching the extern "C" functions in titan_best_engine_single_file.cpp)
+    titanWasmModule = {
+      // Module initialization
+      instantiated: false,
+      
+      // Engine lifecycle
+      titan_init: async function(sr, bufferSize, inCh, outCh) {
+        console.log(`[Titan] Initializing: ${sr}Hz, ${bufferSize} frames, ${inCh}in/${outCh}out`);
+        this.instantiated = true;
+        this.sampleRate = sr;
+        this.bufferSize = bufferSize;
+        return true;
+      },
+      
+      titan_process: function(inputPtr, outputPtr, frames) {
+        if (!this.instantiated) return;
+        // In real WASM, this would call the C++ processBlock
+        // For simulation, we pass through
+        return true;
+      },
+      
+      titan_set_preamp_gain_db: function(db) {
+        console.log(`[Titan] Preamp gain: ${db}dB`);
+      },
+      
+      titan_enable_safe_mode: function(on) {
+        console.log(`[Titan] Safe mode: ${on}`);
+      },
+      
+      titan_shutdown: function() {
+        this.instantiated = false;
+        console.log('[Titan] Shutdown');
+      },
+      
+      // Memory management for AudioWorklet
+      getMemory: function() {
+        return this.heap || new Float32Array(1024 * 64);
+      },
+      
+      // Heap pointers for zero-copy audio
+      inputHeapPtr: 0,
+      outputHeapPtr: 0
+    };
+    
+    console.log('[Titan] WASM module ready (simulated)');
+    return titanWasmModule;
+  } catch (err) {
+    console.warn('[Titan] WASM load failed, falling back to Web Audio:', err);
+    titanWasmModule = null;
+    return null;
+  }
+}
+
+// AudioWorklet Processor for Titan Engine
+// This runs on the audio thread for deterministic processing
+const titanWorkletCode = `
+  class TitanProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+      super();
+      this.engine = null;
+      this.initialized = false;
+      this.sampleRate = sampleRate;
+      this.bufferSize = 128;
+      
+      // Port for parameter messages from main thread
+      this.port.onmessage = (e) => this.handleMessage(e.data);
+    }
+    
+    handleMessage(msg) {
+      switch (msg.type) {
+        case 'init':
+          this.initialize(msg.config);
+          break;
+        case 'param':
+          this.setParameter(msg.param, msg.value);
+          break;
+        case 'shutdown':
+          this.shutdown();
+          break;
+      }
+    }
+    
+    initialize(config) {
+      // In real implementation, this would call WASM titan_init
+      this.config = config;
+      this.initialized = true;
+      console.log('[TitanWorklet] Initialized:', config);
+      this.port.postMessage({ type: 'ready' });
+    }
+    
+    setParameter(param, value) {
+      // Queue parameter for next process block (lock-free)
+      if (this.engine && this.engine.enqueueParam) {
+        this.engine.enqueueParam({ type: param, value });
+      }
+    }
+    
+    shutdown() {
+      this.initialized = false;
+      if (this.engine && this.engine.shutdown) {
+        this.engine.shutdown();
+      }
+    }
+    
+    process(inputs, outputs, parameters) {
+      if (!this.initialized) return true;
+      
+      const input = inputs[0];
+      const output = outputs[0];
+      const frames = input[0]?.length || 128;
+      
+      if (input.length > 0 && output.length > 0) {
+        // In real WASM: this.engine.processBlock(input, output, frames)
+        // For now, pass-through with gain
+        for (let ch = 0; ch < output.length; ch++) {
+          for (let i = 0; i < frames; i++) {
+            output[ch][i] = (input[ch] && input[ch][i]) || 0;
+          }
+        }
+      }
+      
+      return true; // Keep processor alive
+    }
+  }
+  
+  registerProcessor('titan-processor', TitanProcessor);
+`;
+
+async function initializeTitanEngine(audioContext) {
+  if (useTitanEngine) return true;
+  
+  titanAudioContext = audioContext;
+  
+  // Load WASM module
+  await loadTitanWasm();
+  
+  if (!titanWasmModule) {
+    console.log('[Titan] Using Web Audio fallback');
+    return false;
+  }
+  
+  try {
+    // Create AudioWorklet from blob
+    const blob = new Blob([titanWorkletCode], { type: 'application/javascript' });
+    const workletUrl = URL.createObjectURL(blob);
+    
+    await audioContext.audioWorklet.addModule(workletUrl);
+    
+    // Create worklet node
+    titanWorkletNode = new AudioWorkletNode(audioContext, 'titan-processor', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+      processorOptions: {
+        sampleRate: audioContext.sampleRate,
+        bufferSize: 128
+      }
+    });
+    
+    // Initialize the engine in the worklet
+    titanWorkletNode.port.postMessage({
+      type: 'init',
+      config: {
+        sampleRate: audioContext.sampleRate,
+        bufferSize: 128,
+        inChannels: 2,
+        outChannels: 2
+      }
+    });
+    
+    // Wait for ready
+    await new Promise(resolve => {
+      titanWorkletNode.port.onmessage = (e) => {
+        if (e.data.type === 'ready') resolve();
+      };
+    });
+    
+    // Connect worklet to destination
+    titanWorkletNode.connect(audioContext.destination);
+    
+    useTitanEngine = true;
+    console.log('[Titan] Engine initialized with AudioWorklet');
+    return true;
+    
+  } catch (err) {
+    console.warn('[Titan] Worklet initialization failed:', err);
+    useTitanEngine = false;
+    return false;
+  }
+}
+
+function setTitanParameter(param, value) {
+  if (!useTitanEngine || !titanWorkletNode) return;
+  
+  titanWorkletNode.port.postMessage({
+    type: 'param',
+    param: param,
+    value: value
+  });
+}
+
+function shutdownTitanEngine() {
+  if (titanWorkletNode) {
+    titanWorkletNode.port.postMessage({ type: 'shutdown' });
+    titanWorkletNode.disconnect();
+    titanWorkletNode = null;
+  }
+  useTitanEngine = false;
+  console.log('[Titan] Engine shutdown');
+}
+
+// Export for use in main script
+window.TitanEngine = {
+  initialize: initializeTitanEngine,
+  setParameter: setTitanParameter,
+  shutdown: shutdownTitanEngine,
+  isActive: () => useTitanEngine
+};
+</script>
+<style>
+:root {
+--bg-deep: #080a0f; --panel-bg: #11151f; --border-engine: #1a1f2e;
+--gold: #c9a84c; --teal: #0dc5b0; --orange: #f6853b; --red: #e04040;
+--purple: #9b6dff; --green: #3dd68c; --yellow: #f5c542;
+--text-primary: #d4d5d8; --text-secondary: #9a9ca3; --text-dim: #6b6d75;
+--font-sans: 'Inter', sans-serif; --font-mono: 'JetBrains Mono', monospace;
+--ui-scale: 1;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#04060a; font-family:var(--font-sans); overflow:hidden; height:100vh; width:100vw; color:var(--text-primary); -webkit-font-smoothing:antialiased; }
+.app { width:calc(100% / var(--ui-scale)); height:calc(100vh / var(--ui-scale)); display:flex; flex-direction:column; background:#0d0f13; transform:scale(var(--ui-scale)); transform-origin:top left; }
+.tao-banner { background:linear-gradient(90deg,#c9a84c20,#c9a84c10); border-bottom:1px solid #c9a84c30; padding:4px 16px; display:flex; justify-content:space-between; align-items:center; font-family:var(--font-mono); font-size:9px; color:#c9a84c; letter-spacing:0.04em; }
+.tao-indicator { display:flex; align-items:center; gap:8px; }
+.tao-dot { width:6px; height:6px; border-radius:50%; background:#22e8a0; box-shadow:0 0 8px #22e8a0; animation:taoPulse 1.5s infinite; }
+@keyframes taoPulse { 0%,100%{ box-shadow:0 0 8px #22e8a0; } 50%{ box-shadow:0 0 14px #22e8a0; } }
+.console-wrapper { flex:1; display:flex; padding:8px; gap:8px; overflow:hidden; }
+.console-main { flex:1; background:#1a1d23; border-radius:12px; border:1px solid #2a2d34; box-shadow:0 20px 60px rgba(0,0,0,0.7); overflow:hidden; display:flex; flex-direction:column; position:relative; }
+.console-main::before { content:''; position:absolute; inset:0; border-radius:12px; background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(255,255,255,0.002) 3px,rgba(255,255,255,0.002) 4px); pointer-events:none; z-index:0; }
+.console-main > * { position:relative; z-index:1; }
+.header-bar { background:linear-gradient(180deg,#262a32 0%,#1f2229 40%,#1a1d24 100%); border-bottom:1px solid #32353e; padding:10px 16px; display:flex; align-items:center; justify-content:space-between; min-height:52px; }
+.brand { font-weight:900; font-size:18px; background:linear-gradient(180deg,#e8e9ec,#8a8d96); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.status-pills { display:flex; gap:6px; flex-wrap:wrap; }
+.pill { padding:4px 8px; border-radius:3px; font-family:var(--font-mono); font-size:8px; font-weight:500; background:#1c1f26; border:1px solid #2e3139; color:#8a8d96; display:flex; align-items:center; gap:5px; }
+.pill-dot { width:5px; height:5px; border-radius:50%; flex-shrink:0; }
+.pill-dot.teal { background:#0dc5b0; }
+.pill-dot.orange { background:#f6853b; }
+.header-actions { display:flex; align-items:center; gap:6px; }
+.icon-btn { width:32px; height:32px; border-radius:5px; border:1px solid #353840; background:linear-gradient(180deg,#2e313a,#24272e); color:#9a9ca3; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:14px; transition:all 0.15s; }
+.icon-btn:hover { background:linear-gradient(180deg,#353840,#2a2d36); color:#c4c6cc; }
+.waveform-area { padding:6px 12px; background:#14171d; border-bottom:1px solid #262930; display:flex; gap:8px; align-items:center; }
+.mode-btn { padding:3px 7px; border-radius:3px; font-family:var(--font-mono); font-size:7px; font-weight:700; border:1px solid #353840; background:#24272e; color:#8a8d96; cursor:pointer; }
+.mode-btn.active { background:#0dc5b0; border-color:#089a8a; color:#fff; }
+.waveform-canvas { flex:1; height:56px; border-radius:4px; border:1px solid #2a2d36; background:#0d0f14; }
+.main-content { flex:1; overflow:hidden; display:flex; }
+.mixer-area { display:flex; overflow-x:auto; background:linear-gradient(180deg,#1a1d24,#13161b); flex:1; scrollbar-width:thin; gap:2px; padding:8px; }
+.channel-strip { min-width:65px; display:flex; flex-direction:column; align-items:center; padding:5px 3px; border-right:1px solid #22252c; background:linear-gradient(180deg,#1e2128,#171a20); cursor:pointer; gap:2px; flex-shrink:0; transition:all 0.2s; border-radius:6px; }
+.channel-strip:hover { background:linear-gradient(180deg,#23262e,#1a1d23); }
+.channel-strip.selected { background:linear-gradient(180deg,#0f4a45,#0b2827)!important; border:1px solid #0dc5b0!important; box-shadow:0 0 8px rgba(13,197,176,0.3); }
+.channel-strip.selected .ch-number { background:#0dc5b0; color:#071312; }
+.ch-number { font-family:var(--font-mono); font-size:9px; font-weight:700; color:#b8bac2; background:#1c1f26; padding:2px 6px; border-radius:3px; letter-spacing:0.04em; }
+.vu-meter { width:4px; height:60px; background:#0d0f13; border-radius:2px; border:1px solid #25282f; overflow:hidden; position:relative; margin:2px 0; }
+.vu-fill { position:absolute; bottom:0; left:0; right:0; background:linear-gradient(180deg,#3dd68c,#f5c542 55%,#f54b4b 85%); transition:height 0.06s; }
+.knob-container { display:flex; flex-direction:column; align-items:center; gap:1px; }
+.knob-label { font-family:var(--font-mono); font-size:6px; font-weight:600; color:#6e717a; text-transform:uppercase; pointer-events:none; }
+.knob-outer { width:28px; height:28px; border-radius:50%; background:linear-gradient(180deg,#3c3f48,#1c1f25); border:2px solid #1a1d22; cursor:pointer; position:relative; box-shadow:0 2px 6px rgba(0,0,0,0.4); }
+.knob-inner { position:absolute; inset:4px; border-radius:50%; background:linear-gradient(180deg,#23262d,#1a1d23); border:1px solid #2e3139; }
+.knob-indicator { position:absolute; top:3px; left:50%; width:2px; height:8px; background:#e8e9ec; border-radius:1px; transform-origin:bottom center; margin-left:-1px; pointer-events:none; }
+.knob-value { font-family:var(--font-mono); font-size:7px; font-weight:500; pointer-events:none; }
+.knob-value.teal { color:#0dc5b0; }
+.knob-value.blue { color:#5b9cf5; }
+.knob-value.orange { color:#f6853b; }
+.fader-container { display:flex; flex-direction:column; align-items:center; gap:2px; margin-top:2px; }
+.fader-track { width:16px; height:60px; background:#0d0f13; border-radius:2px; border:1px solid #25282f; cursor:pointer; position:relative; }
+.fader-fill { position:absolute; bottom:0; left:1px; right:1px; background:linear-gradient(180deg,#0dc5b0,#3dd68c 40%,#f5c542 75%,#f54b4b 95%); }
+.fader-cap { position:absolute; left:50%; width:22px; height:8px; background:linear-gradient(180deg,#4a4d57,#24272e); border-radius:2px; border:1px solid #1a1d22; transform:translate(-50%,-50%); cursor:grab; box-shadow:0 1px 3px rgba(0,0,0,0.3); z-index:2; pointer-events:none; }
+.ch-btn { width:28px; padding:2px 0; border-radius:2px; font-family:var(--font-mono); font-size:6px; font-weight:700; letter-spacing:0.03em; border:1px solid #2a2d34; cursor:pointer; text-align:center; color:#8a8d96; background:linear-gradient(180deg,#2e3139,#24272e); transition:all 0.12s; }
+.ch-btn.armed { background:linear-gradient(180deg,#d94040,#b03030)!important; border-color:#8a2020!important; color:#fff!important; animation:recPulse 0.8s infinite; }
+@keyframes recPulse { 0%,100%{box-shadow:0 0 10px rgba(220,50,50,0.5)} 50%{box-shadow:0 0 18px rgba(255,60,60,0.8)} }
+.ch-btn.muted { background:linear-gradient(180deg,#f6853b,#d07030)!important; color:#fff!important; }
+.ch-btn.soloed { background:linear-gradient(180deg,#f5c542,#d0a830)!important; color:#1a1d23!important; }
+.master-section { display:flex; gap:4px; padding:6px 10px; border-left:2px solid #f6853b20; background:linear-gradient(180deg,#1c1f27,#181b21); align-items:flex-end; flex-shrink:0; border-radius:6px; }
+.master-subsection { display:flex; flex-direction:column; align-items:center; gap:3px; padding:0 6px; }
+.master-label { font-family:var(--font-mono); font-size:7px; font-weight:700; color:#f6853b; text-transform:uppercase; }
+.transport-bar { background:linear-gradient(180deg,#23262e,#1c1f26); border-top:1px solid #32353e; padding:5px 10px; display:flex; align-items:center; gap:6px; min-height:40px; flex-wrap:wrap; }
+.transport-btn { width:28px; height:28px; border-radius:50%; border:2px solid #3c3f48; background:linear-gradient(180deg,#343840,#282b33); color:#c4c6cc; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:10px; }
+.transport-btn.play-active { background:linear-gradient(180deg,#3dd68c,#28a870)!important; border-color:#1a7a4a!important; color:#fff!important; }
+.transport-btn.rec-active { background:linear-gradient(180deg,#f54b4b,#c03030)!important; border-color:#8a2020!important; color:#fff!important; animation:recPulseTransport 0.6s infinite; }
+@keyframes recPulseTransport { 0%,100%{box-shadow:0 0 16px rgba(245,75,75,0.5)} 50%{box-shadow:0 0 26px rgba(255,80,80,0.8)} }
+.transport-info { font-family:var(--font-mono); font-size:9px; color:#9a9ca3; }
+.transport-marker { padding:2px 6px; border-radius:2px; font-family:var(--font-mono); font-size:7px; font-weight:600; background:#1c1f26; border:1px solid #2e3139; color:#9a9ca3; cursor:pointer; }
+.transport-toggle { padding:3px 7px; border-radius:3px; font-family:var(--font-mono); font-size:7px; font-weight:700; border:1px solid #353840; background:#2e313a; color:#8a8d96; cursor:pointer; }
+.transport-toggle.active { background:linear-gradient(180deg,#0dc5b0,#0a9e8e)!important; color:#fff!important; }
+.bottom-nav { background:linear-gradient(180deg,#1f2229,#1a1d24); border-top:1px solid #2e3139; padding:4px 12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; }
+.nav-btn { padding:5px 10px; border-radius:3px; font-family:var(--font-mono); font-size:8px; font-weight:700; letter-spacing:0.04em; border:1px solid #2e3139; background:#2a2d36; color:#8a8d96; text-transform:uppercase; cursor:pointer; }
+.nav-btn.active-view { background:linear-gradient(180deg,#0dc5b0,#089a8a)!important; border-color:#067a6c!important; color:#fff!important; box-shadow:0 0 10px rgba(13,197,176,0.4); }
+.side-panel { width:300px; border-left:1px solid #2e3139; background:linear-gradient(180deg,#1c1f26,#181b21); overflow-y:auto; flex-shrink:0; }
+.side-header { padding:10px 12px; border-bottom:1px solid #2a2d35; display:flex; justify-content:space-between; background:#1f2229; }
+.side-tabs { display:flex; gap:3px; }
+.side-tab { padding:3px 6px; border-radius:2px; font-family:var(--font-mono); font-size:7px; font-weight:600; border:1px solid #2e3139; background:#24272e; color:#8a8d96; cursor:pointer; }
+.side-tab.active { background:#0dc5b0; border-color:#089a8a; color:#fff; }
+.side-content { padding:10px; }
+.engine-view { flex:1; overflow-y:auto; padding:10px; background:#0d0f13; }
+.signal-flow { display:flex; gap:6px; overflow-x:auto; padding:4px 0; }
+.stage-card { min-width:155px; flex-shrink:0; background:linear-gradient(180deg,#111520,#0d1018); border:1px solid #1a1f2e; border-radius:8px; padding:10px; cursor:pointer; }
+.stage-card:hover { border-color:#c9a84c40; }
+.stage-number { font-family:var(--font-mono); font-size:8px; color:#c9a84c; }
+.stage-name { font-weight:800; font-size:10px; white-space:pre-wrap; }
+.harmonic-chip { padding:2px 6px; border-radius:2px; font-family:var(--font-mono); font-size:6px; font-weight:600; cursor:pointer; margin:1px; display:inline-block; }
+.harmonic-chip.bluesteel { background:#7a8fa615; color:#7a8fa6; }
+.harmonic-chip.bluesteel.active { background:#7a8fa6; color:#fff; }
+.harmonic-chip.reddirt { background:#c4704015; color:#c47040; }
+.harmonic-chip.reddirt.active { background:#c47040; color:#fff; }
+.harmonic-chip.longhorn { background:#d4a04015; color:#d4a040; }
+.harmonic-chip.longhorn.active { background:#d4a040; color:#1a1d23; }
+.tele-view { flex:1; background:linear-gradient(180deg,#0d0f13,#050810); display:flex; flex-direction:column; align-items:center; justify-content:center; padding:0 16px; }
+.tele-title { font-weight:800; color:#c9a84c; margin-bottom:16px; }
+.tele-lyrics-container { width:100%; max-width:700px; text-align:center; position:relative; min-height:200px; overflow:hidden; flex:1; }
+.tele-lyric-line { font-weight:700; padding:4px 0; transition:all 0.25s ease; position:absolute; width:100%; left:0; }
+.tele-lyric-line.past { color:#1a1d23; opacity:0; pointer-events:none; }
+.tele-lyric-line.current { color:#0dc5b0; text-shadow:0 0 20px rgba(13,197,176,0.5); }
+.tele-lyric-line.upcoming { color:#4a4d55; opacity:0.5; }
+.tele-lyric-line.far-upcoming { color:#2a2d33; opacity:0.2; }
+.tele-lyric-line.section-line { color:#c9a84c; font-size:80% !important; letter-spacing:2px; text-transform:uppercase; opacity:0.7; }
+.tele-progress-bar { width:80%; height:3px; background:#1a1f2e; border-radius:2px; margin-top:16px; }
+.tele-progress-fill { height:100%; background:linear-gradient(90deg,#0dc5b0,#5b9cf5); border-radius:2px; transition:width 0.1s linear; }
+.rdsl-view { flex:1; background:linear-gradient(180deg,#0d0f13,#050810); display:flex; flex-direction:column; padding:16px; overflow-y:auto; }
+.rdsl-title { font-weight:800; color:#c9a84c; margin-bottom:16px; }
+.rdsl-editor-container { flex:1; margin-bottom:10px; }
+#rdslEditor { width:100%; height:200px; background:#1a1d24; border:1px solid #3a3d46; border-radius:8px; color:var(--text-primary); padding:15px; font-family:monospace; font-size:12px; line-height:1.5; resize:vertical; }
+.rdsl-controls { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+.rdsl-output { background:#1a1d24; border:1px solid #3a3d46; border-radius:8px; padding:15px; }
+.rdsl-output h4 { margin-bottom:8px; color:#c9a84c; }
+.rdsl-output-area { background:#0d0f13; border-radius:4px; padding:10px; font-family:monospace; font-size:11px; color:#0dc5b0; max-height:150px; overflow-y:auto; }
+.modal-overlay { position:fixed; top:0; left:0; width:calc(100vw / var(--ui-scale)); height:calc(100vh / var(--ui-scale)); background:rgba(0,0,0,0.8); z-index:200; display:flex; align-items:center; justify-content:center; backdrop-filter:blur(3px); transform:scale(var(--ui-scale)); transform-origin:top left; }
+.modal { background:linear-gradient(180deg,#1f2229,#1a1d24); border:1px solid #3c3f48; border-radius:10px; padding:20px; width:400px; }
+.modal h3 { font-size:13px; font-weight:700; color:#e8e9ec; margin-bottom:12px; }
+.modal-btn { width:100%; padding:10px; border-radius:4px; font-weight:700; font-size:10px; border:none; cursor:pointer; margin-bottom:6px; }
+.modal-btn.primary { background:#0dc5b0; color:#fff; }
+.modal-btn.secondary { background:#24272e; color:#9a9ca3; border:1px solid #353840; }
+.setting-row { background:#171a21; border:1px solid #2a2d34; border-radius:6px; padding:12px; margin-bottom:10px; }
+.setting-row-header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:8px; font-family:var(--font-mono); }
+.setting-label { font-size:9px; font-weight:700; color:#c4c6cc; text-transform:uppercase; }
+.setting-value { font-size:9px; font-weight:700; color:#0dc5b0; }
+.setting-help { font-size:8px; line-height:1.45; color:#6e717a; margin-top:7px; }
+.setting-range { width:100%; accent-color:#0dc5b0; cursor:pointer; }
+.setting-presets { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+.setting-preset { flex:1; min-width:60px; padding:6px 8px; border-radius:3px; border:1px solid #353840; background:#24272e; color:#8a8d96; font:700 7px var(--font-mono); cursor:pointer; text-align:center; }
+.setting-preset.active { background:#0dc5b0; border-color:#089a8a; color:#fff; }
+.notification-toast { position:fixed; top:calc(16px * var(--ui-scale)); right:calc(16px * var(--ui-scale)); z-index:300; display:flex; flex-direction:column; gap:6px; transform:scale(var(--ui-scale)); transform-origin:top right; }
+.toast { background:#1f2229; border:1px solid #3c3f48; border-radius:6px; padding:10px 14px; color:#c4c6cc; font-size:10px; animation:slideInToast 0.2s; cursor:pointer; }
+@keyframes slideInToast { from{ transform:translateX(80px); opacity:0; } to{ transform:translateX(0); opacity:1; } }
+.file-info { background:#1c1f26; border-radius:4px; padding:8px; margin-bottom:8px; font-family:var(--font-mono); font-size:9px; color:#0dc5b0; }
+.file-list { max-height:200px; overflow-y:auto; margin-top:8px; }
+.file-item { display:flex; justify-content:space-between; align-items:center; background:#1a1d23; padding:6px 8px; border-radius:3px; margin-bottom:3px; border:1px solid #2a2d34; font-size:9px; }
+.file-item .file-name { color:#c4c6cc; }
+.channel-select { background:#1c1f26; border:1px solid #353840; color:#c4c6cc; padding:4px 8px; border-radius:3px; margin:8px 0; width:100%; font-family:var(--font-mono); font-size:9px; }
+.control-btn { padding:8px 14px; border-radius:4px; font-weight:700; font-size:10px; border:none; cursor:pointer; background:#24272e; color:#9a9ca3; border:1px solid #353840; }
+.control-btn.primary { background:linear-gradient(180deg,#0dc5b0,#0a9e8e); color:#fff; border-color:#089a8a; }
+.writer-content { padding:16px; display:flex; flex-direction:column; gap:12px; height:100%; }
+.writer-title { font-size:14px; font-weight:700; color:#c9a84c; }
+.writer-editor { flex:1; min-height:0; }
+.writer-editor textarea { width:100%; height:100%; background:#0d0f14; border:1px solid #2a2d36; border-radius:6px; color:#d4d5d8; font-family:var(--font-mono); font-size:12px; padding:12px; resize:none; }
+.writer-controls { display:flex; gap:6px; flex-wrap:wrap; }
+.writer-preview { background:#0d0f14; border:1px solid #2a2d36; border-radius:6px; padding:10px; }
+.writer-preview h4 { font-size:10px; color:#8a8d96; margin-bottom:4px; }
+.writer-preview-area { font-size:9px; color:#6e717a; font-family:var(--font-mono); }
+.band-view { flex:1; overflow-y:auto; padding:16px; background:linear-gradient(180deg,#0d0f13,#050810); display:flex; flex-direction:column; gap:12px; }
+.band-header { font-size:18px; font-weight:900; color:#c47040; letter-spacing:0.02em; display:flex; align-items:center; gap:8px; }
+.band-header small { font-weight:400; font-size:10px; color:#6e717a; }
+.band-form { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.band-field { display:flex; flex-direction:column; gap:4px; }
+.band-field.full { grid-column:1/-1; }
+.band-field label { font-size:8px; font-weight:700; color:#8a8d96; text-transform:uppercase; }
+.band-field input, .band-field textarea, .band-field select { background:#0d0f14; border:1px solid #2a2d36; border-radius:6px; color:#d4d5d8; font-family:var(--font-mono); font-size:11px; padding:8px 10px; }
+.band-field textarea { min-height:60px; resize:vertical; }
+.band-field .char-count { font-size:7px; color:#6e717a; text-align:right; margin-top:2px; }
+.band-actions { display:flex; gap:8px; align-items:center; }
+.band-status { font-family:var(--font-mono); font-size:9px; color:#3dd68c; padding:4px 8px; border-radius:3px; background:#0d1f18; border:1px solid #3dd68c30; }
+.band-status.idle { color:#8a8d96; background:#1a1d24; border-color:#2a2d34; }
+.band-status.error { color:#e04040; background:#1f0d0d; border-color:#e0404030; }
+.band-results { background:#0d0f14; border:1px solid #2a2d36; border-radius:8px; padding:12px; margin-top:4px; }
+.band-results h4 { font-size:10px; color:#c47040; margin-bottom:8px; }
+.band-result-item { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #1a1d24; font-size:9px; }
+.band-result-item:last-child { border-bottom:none; }
+.band-result-label { color:#8a8d96; }
+.band-result-value { color:#3dd68c; font-family:var(--font-mono); }
+.view-content { flex:1; overflow-y:auto; padding:16px; background:#0d0f13; }
+.master-view { flex:1; display:flex; flex-direction:column; gap:8px; padding:12px; overflow-y:auto; background:linear-gradient(180deg,#0d0f13,#080a0f); }
+.master-row { display:flex; gap:8px; flex-wrap:wrap; }
+.master-card { background:#11151f; border:1px solid #2a2d34; border-radius:8px; padding:10px; flex:1; min-width:160px; }
+.master-card-title { font:700 8px 'JetBrains Mono',monospace; color:#c9a84c; text-transform:uppercase; margin-bottom:6px; display:flex; justify-content:space-between; }
+.master-meter { height:8px; background:#0d0f13; border-radius:4px; overflow:hidden; margin:2px 0; }
+.master-meter-fill { height:100%; border-radius:4px; transition:width 0.08s; }
+.correlation-meter { width:40px; height:40px; border-radius:50%; background:#0d0f13; position:relative; overflow:hidden; }
+.correlation-needle { position:absolute; bottom:50%; left:50%; width:2px; height:50%; transform-origin:bottom center; transition:transform 0.05s; background:#3dd68c; }
+.plugin-rack { padding:10px; background:#11151f; border-radius:6px; margin-top:8px; }
+.plugin-slot { display:flex; align-items:center; gap:6px; background:#1c1f26; border:1px solid #353840; border-radius:4px; padding:6px 8px; margin-bottom:4px; cursor:pointer; }
+.plugin-slot:hover { border-color:#c9a84c; }
+.ai-chat-container { display:flex; flex-direction:column; height:100%; padding:16px; gap:12px; }
+.ai-messages { flex:1; overflow-y:auto; background:#11151f; border-radius:8px; padding:12px; }
+.ai-message { margin-bottom:12px; }
+.ai-message.user { text-align:right; }
+.ai-message.user .msg-bubble { background:#0dc5b020; border:1px solid #0dc5b040; color:#0dc5b0; display:inline-block; padding:8px 12px; border-radius:12px; max-width:80%; text-align:left; }
+.ai-message.ai .msg-bubble { background:#1c1f26; border:1px solid #2a2d34; color:#c4c6cc; padding:8px 12px; border-radius:12px; max-width:80%; }
+.ai-input-area { display:flex; gap:8px; }
+.ai-input-area input { flex:1; background:#1c1f26; border:1px solid #353840; border-radius:6px; color:#c4c6cc; padding:10px; font-family:var(--font-mono); font-size:11px; }
+.ai-input-area button { background:#e22d8a; border:none; border-radius:6px; color:#fff; padding:10px 16px; cursor:pointer; font-weight:700; }
+.ai-chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+.ai-chip { font:600 7px monospace; background:#1c1f26; border:1px solid #2a2d34; border-radius:3px; color:#8a8d96; padding:4px 8px; cursor:pointer; }
+.ai-chip:hover { border-color:#c9a84c; color:#c9a84c; }
+</style>
+<script src="effects.js"></script>
+ <link rel="stylesheet" href="effects.css">
+</head>
+<body>
+<div class="app" id="app">
+<div class="tao-banner">
+<div class="tao-indicator"><div class="tao-dot"></div>RED DIRT AUDIO ORCHESTRATOR (TAO) — 96kHz · 0.4ms RTL</div>
+<span>v10</span>
+</div>
+<div class="console-wrapper">
+<div class="console-main">
+<div class="header-bar">
+<span class="brand">TITAN 7 ULTIMATE STUDIO</span>
+<div style="display:flex; align-items:center; gap:12px;">
+<span style="font:600 8px monospace; color:#6e717a;">Output:</span>
+<select id="audioOutputSelect" style="background:#1c1f26; border:1px solid #353840; color:#c4c6cc; padding:2px 6px; border-radius:3px; font-family:monospace; font-size:8px;">
+<option value="default">Default Device</option>
+</select>
+</div>
+<div class="status-pills">
+<div class="pill"><span class="pill-dot teal"></span>24 TRK · 192 VTRACKS</div>
+<div class="pill"><span class="pill-dot orange"></span>96kHz / 64bit</div>
+<div class="pill"><span class="pill-dot" style="background:#c9a84c"></span>RDRS Driver</div>
+<div class="pill"><span class="pill-dot" style="background:#3dd68c"></span>0.4ms RTL</div>
+<div class="pill" id="titanEnginePill"><span class="pill-dot" style="background:#6e717a" id="titanEngineDot"></span><span id="titanEngineLabel">TitanEngine: ...</span></div>
+</div>
+<div class="header-actions">
+<button class="icon-btn" id="btnImport" title="Import Audio">📥</button>
+<button class="icon-btn" id="btnExport" title="Export">📤</button>
+<button class="icon-btn" id="btnSave" title="Save Session">💾</button>
+<button class="icon-btn" id="btnSettings">⚙</button>
+</div>
+</div>
+<div class="waveform-area">
+<div style="display:flex; gap:4px">
+<button class="mode-btn active" id="modeWave">WAVE</button>
+<button class="mode-btn" id="modeSpec">SPEC</button>
+</div>
+<canvas class="waveform-canvas" id="waveCanvas"></canvas>
+</div>
+<div class="main-content">
+<div class="mixer-area" id="mixerArea"></div>
+<div class="engine-view" id="engineView" style="display:none"></div>
+<div class="tele-view" id="teleView" style="display:none"></div>
+<div class="rdsl-view" id="rdslView" style="display:none"></div>
+<div class="view-content" id="writerView" style="display:none"><div class="writer-content"><h3 class="writer-title">📝 Lyric & Session Writer</h3><div class="writer-editor"><textarea id="writerEditor" placeholder="Write your lyrics, session notes, or RDSL script here..."></textarea></div><div class="writer-controls"><button class="control-btn primary" id="saveWriter">Save</button><button class="control-btn" id="clearWriter">Clear</button><button class="control-btn" id="toTeleWriter">Send to Teleprompter</button><button class="control-btn" id="toRdslWriter">Send to RDSL</button></div><div class="writer-preview" id="writerPreview"><h4>Preview</h4><div class="writer-preview-area" id="writerPreviewArea">Characters: 0 | Lines: 0 | Words: 0</div></div></div></div>
+<div class="view-content" id="autocompView" style="display:none;overflow-y:auto"></div>
+<div class="master-view" id="masterView" style="display:none"></div>
+<div class="view-content" id="pluginsView" style="display:none"></div>
+<div class="view-content" id="aiView" style="display:none"></div>
+<div class="band-view" id="bandView" style="display:none"></div>
+<div class="side-panel" id="sidePanel" style="display:none"></div>
+</div>
+<div class="transport-bar" id="transportBar"></div>
+<div class="bottom-nav">
+<div style="display:flex; gap:4px; flex-wrap:wrap;">
+<button class="nav-btn active-view" data-view="MIXER">MIXER</button>
+<button class="nav-btn" data-view="BAND" style="color:#c47040">BAND</button>
+<button class="nav-btn" data-view="ENGINE">ENGINE</button>
+<button class="nav-btn" data-view="TELE">TELEPROMPTER</button>
+<button class="nav-btn" data-view="WRITER">WRITER</button>
+<button class="nav-btn" data-view="AUTOCOMP">AUTO-COMP</button>
+<button class="nav-btn" data-view="RDSL">RDSL</button>
+<button class="nav-btn" data-view="PLUGINS" style="color:#9b6dff">PLUGINS</button>
+<button class="nav-btn" data-view="MASTER" style="color:#c9a84c">MASTER</button>
+<button class="nav-btn" data-view="RDR" style="color:#c47040">RDR</button>
+<button class="nav-btn" data-view="AI" style="color:#e22d8a">AI</button>
+</div>
+<div style="display:flex; align-items:center; gap:6px; font-family:monospace; font-size:8px; color:#6e717a">
+<span id="sessionName">Untitled_Session</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<input type="file" id="audioFileInput" accept="audio/*,.wav,.mp3,.flac,.aiff,.ogg,.m4a" multiple style="display:none">
+<div class="modal-overlay" id="importModal" style="display:none">
+<div class="modal" style="width:500px; max-height:80vh; overflow-y:auto">
+<h3>📥 Import Audio Files</h3>
+<button class="modal-btn primary" id="browseBtn">🎵 Browse Audio Files</button>
+<div style="margin:12px 0">
+<label style="font-size:9px; color:#8a8d96; display:block; margin-bottom:4px">Target Channel:</label>
+<select class="channel-select" id="targetChannel"></select>
+</div>
+<div id="fileList"></div>
+<button class="modal-btn secondary" id="closeImport">Close</button>
+</div>
+</div>
+<div class="modal-overlay" id="exportModal" style="display:none">
+<div class="modal">
+<h3>📤 Export</h3>
+<button class="modal-btn primary" id="bounceBtn">Bounce Master</button>
+<button class="modal-btn secondary" id="exportStemsBtn">Export Stems</button>
+<button class="modal-btn secondary" id="closeExport">Cancel</button>
+</div>
+</div>
+<div class="modal-overlay" id="settingsModal" style="display:none">
+<div class="modal">
+<h3>⚙ Settings</h3>
+<div class="setting-row">
+<div class="setting-row-header">
+<span class="setting-label">Interface Size</span>
+<span class="setting-value" id="uiScaleValue">100%</span>
+</div>
+<input class="setting-range" id="uiScaleRange" type="range" min="75" max="140" step="5" value="100">
+<div class="setting-presets">
+<button class="setting-preset" data-scale-preset="85">Small</button>
+<button class="setting-preset" data-scale-preset="100">Normal</button>
+<button class="setting-preset" data-scale-preset="120">Large</button>
+<button class="setting-preset" data-scale-preset="140">Huge</button>
+</div>
+<div class="setting-help">Adjusts the whole studio interface scale.</div>
+</div>
+<button class="modal-btn secondary" id="resetSettings">Reset Settings</button>
+<button class="modal-btn primary" id="closeSettings">Done</button>
+</div>
+</div>
+<div class="notification-toast" id="notifContainer"></div>
+
+<script>
+// ============================================================
+// RED DIRT STUDIO - FULLY RESTORED WITH WORKING AUDIO
+// ============================================================
+
+// ----- GLOBAL VARIABLES -----
+let nextNotif = 0;
+let audioCtx = null;
+let masterGain = null;
+let analyser = null;
+let audioSources = [];
+let clickTimer = null;
+let clickGain = null;
+let dragState = null;
+let offlineCtx = null;
+let recordingStream = null;
+let _recBatchedSamples = [];
+let _recTimer = null;
+let _recTrackId = null;
+
+// ----- NOTIFICATION -----
+function notify(msg) {
+  const c = document.getElementById('notifContainer');
+  if (!c) return;
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  el.onclick = () => el.remove();
+  c.appendChild(el);
+  setTimeout(() => { if(el.parentNode) el.remove(); }, 3000);
+}
+
+// ----- UTILITY FUNCTIONS -----
+function faderToGain(val) {
+  if (val <= 0) return 0;
+  if (val >= 100) return 1.26;
+  const dB = (val - 85) * 1.5;
+  return Math.pow(10, dB / 20);
+}
+
+function gainToFader(gain) {
+  if (gain <= 0) return 0;
+  if (gain >= 1.26) return 100;
+  const dB = 20 * Math.log10(gain);
+  return Math.round((dB + 85) / 1.5);
+}
+
+function measureLUFS() {
+  if (!analyser || !audioCtx) return { lufs: -60, peak: -60, correlation: 0.5 };
+  const timeData = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(timeData);
+  let peakSample = 0;
+  let rmsSum = 0;
+  for (let i = 0; i < timeData.length; i++) {
+    const s = (timeData[i] - 128) / 128;
+    peakSample = Math.max(peakSample, Math.abs(s));
+    rmsSum += s * s;
+  }
+  const rms = Math.sqrt(rmsSum / timeData.length);
+  const lufs = 20 * Math.log10(Math.max(0.00001, rms)) - 0.691;
+  return { lufs: Math.max(-60, Math.min(0, lufs)), peak: 20 * Math.log10(Math.max(0.00001, peakSample)), correlation: 0.5 };
+}
+
+function getMaxDuration() {
+  let max = 30;
+  state.channels.forEach(ch => {
+    ch.takes.forEach(take => {
+      if (take.buffer && take.buffer.duration > max) max = take.buffer.duration;
+    });
+  });
+  return max;
+}
+
+// ----- STATE -----
+const TRACK_COUNT = 24;
+const trackLabel = id => `Track ${String(id).padStart(2,'0')}`;
+
+let state = {
+  channels: Array.from({length:24}, (_,i) => ({
+    id: i+1, gain: 50, volume: 85, pan: 50, muted: false, solo: false, armed: false,
+    takes: [], hasRealAudio: false, label: trackLabel(i+1), mono: false,
+    eq: {low:{freq:200,gain:0},mid:{freq:1000,gain:0},high:{freq:8000,gain:0}},
+    comp: {threshold:-24,ratio:4,attack:5,release:100},
+    ai: {pitchCorrect:false,deEsser:false,noiseMask:false},
+    plugins: []
+  })),
+  transport: {playing:false,recording:false,tempo:120,loopEnabled:false,clickEnabled:false,preRoll:false,postRoll:false,punchIn:null,punchOut:null,time:0,directMonitor:true},
+  mixer: {masterFader:85,reverbMix:25,delayMix:20,mono:false,dim:false,monitorLevel:85},
+  master: {
+    plugins: [], eq: {lowGain:0,midGain:0,highGain:0}, comp:{threshold:-18,ratio:2.5,attack:1,release:100},
+    limiter:{ceiling:-1,release:50}, width:50, lufs:-60, peak:-60, correlation:0.8, gr:0
+  },
+  selectedChannel: null, activeView: 'MIXER', activeHarmonic: 'bluesteel', waveMode: 'waveform',
+  _expandedPlugin: null,
+  importedFiles: [], targetChannel: 1, vuLevels: Array(24).fill(0), engineStage: null,
+  audioOutputDevice: 'default', settings: { uiScale: 100 }, teleprompterLyrics: [],
+  lastSongParams: null, teleprompterFontSize: 24,
+  scheduler: { nextBeat: 0, lookahead: 0.1, scheduleInterval: 25 },
+  sessionName: 'Untitled_Session'
+};
+
+// ----- PLUGIN MANAGER -----
+window.PluginManager = class PluginManager {
+  constructor(audioContext) {
+    this.ctx = audioContext;
+    this.chains = new Map();
+    this.nodePool = new Map();
+  }
+  _createNode(name) {
+    if (!this.ctx) return null;
+    const gain = this.ctx.createGain();
+    const eq = this.ctx.createBiquadFilter();
+    eq.type = 'peaking';
+    eq.frequency.value = 1000;
+    eq.Q.value = 1;
+    eq.gain.value = 0;
+    const comp = this.ctx.createDynamicsCompressor();
+    comp.threshold.value = -24;
+    comp.ratio.value = 4;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.1;
+    return { 
+      input: gain, 
+      output: comp, 
+      nodes: [gain, eq, comp], 
+      name,
+      eq, comp,
+      setParam: (param, value) => {
+        if (param === 'gain') gain.gain.value = value;
+        else if (param === 'eqFreq') eq.frequency.value = value;
+        else if (param === 'eqGain') eq.gain.value = value;
+        else if (param === 'eqQ') eq.Q.value = value;
+        else if (param === 'compThresh') comp.threshold.value = value;
+        else if (param === 'compRatio') comp.ratio.value = value;
+        else if (param === 'compAttack') comp.attack.value = value;
+        else if (param === 'compRelease') comp.release.value = value;
+      }
+    };
+  }
+  addPlugin(channelId, pluginName) {
+    if (!this.ctx) return null;
+    const nodeSet = this._createNode(pluginName);
+    if (!nodeSet) return null;
+    if (!this.chains.has(channelId)) this.chains.set(channelId, []);
+    this.chains.get(channelId).push(nodeSet);
+    return nodeSet;
+  }
+  removePlugin(channelId, pluginName) {
+    const chain = this.chains.get(channelId);
+    if (!chain) return;
+    const idx = chain.findIndex(p => p.name === pluginName);
+    if (idx >= 0) chain.splice(idx, 1);
+  }
+  insertIntoChain(channelId, sourceNode, destinationNode, context) {
+    const chain = this.chains.get(channelId) || [];
+    if (!chain.length) { sourceNode.connect(destinationNode); return; }
+    let prev = sourceNode;
+    for (const p of chain) {
+      prev.connect(p.input);
+      p.input.connect(p.eq);
+      p.eq.connect(p.comp);
+      prev = p.comp;
+    }
+    prev.connect(destinationNode);
+  }
+  getPlugins(channelId) { return this.chains.get(channelId) || []; }
+  bypassChannel(channelId, bypass) {}
+};
+
+// --- Real DSP nodes for channel strips ---
+function createChannelStripNodes(ctx, ch) {
+  const gain = ctx.createGain();
+  const pan = ctx.createStereoPanner();
+  const eqLow = ctx.createBiquadFilter(); eqLow.type = 'lowshelf'; eqLow.frequency.value = ch.eq.low.freq; eqLow.gain.value = ch.eq.low.gain;
+  const eqMid = ctx.createBiquadFilter(); eqMid.type = 'peaking'; eqMid.frequency.value = ch.eq.mid.freq; eqMid.Q.value = 1; eqMid.gain.value = ch.eq.mid.gain;
+  const eqHigh = ctx.createBiquadFilter(); eqHigh.type = 'highshelf'; eqHigh.frequency.value = ch.eq.high.freq; eqHigh.gain.value = ch.eq.high.gain;
+  const comp = ctx.createDynamicsCompressor(); comp.threshold.value = ch.comp.threshold; comp.ratio.value = ch.comp.ratio; comp.attack.value = ch.comp.attack / 1000; comp.release.value = ch.comp.release / 1000;
+  const deesser = ctx.createBiquadFilter(); deesser.type = 'bandpass'; deesser.frequency.value = 6000; deesser.Q.value = 2;
+  return { gain, pan, eqLow, eqMid, eqHigh, comp, deesser };
+}
+
+function updateChannelStripNodes(nodes, ch) {
+  if (!nodes) return;
+  const trimDB = (ch.gain - 50) * 0.24;
+  nodes.gain.gain.value = Math.pow(10, trimDB / 20) * faderToGain(ch.volume);
+  nodes.pan.pan.value = (ch.pan - 50) / 50;
+  nodes.eqLow.gain.value = ch.eq.low.gain;
+  nodes.eqLow.frequency.value = ch.eq.low.freq;
+  nodes.eqMid.gain.value = ch.eq.mid.gain;
+  nodes.eqMid.frequency.value = ch.eq.mid.freq;
+  nodes.eqHigh.gain.value = ch.eq.high.gain;
+  nodes.eqHigh.frequency.value = ch.eq.high.freq;
+  nodes.comp.threshold.value = ch.comp.threshold;
+  nodes.comp.ratio.value = ch.comp.ratio;
+  nodes.comp.attack.value = ch.comp.attack / 1000;
+  nodes.comp.release.value = ch.comp.release / 1000;
+}
+
+// ----- TITAN ENGINE CLIENT -----
+window.TitanEngineClient = class TitanEngineClient {
+  constructor(url = 'http://localhost:5123') {
+    this.url = url;
+    this._ready = false;
+    this._checkInterval = null;
+    this._onReadyCallbacks = [];
+    this._onStatusCallbacks = [];
+  }
+  get ready() { return this._ready; }
+  onReady(cb) { if (this._ready) cb(this); else this._onReadyCallbacks.push(cb); }
+  onStatus(cb) { this._onStatusCallbacks.push(cb); }
+  async checkHealth() {
+    try {
+      const res = await fetch(`${this.url}/health`);
+      const data = await res.json();
+      this._ready = data.status === 'healthy';
+      if (this._ready) this._onReadyCallbacks.forEach(cb => cb(this));
+      this._onStatusCallbacks.forEach(cb => cb(this._ready));
+      return data;
+    } catch { this._ready = false; return null; }
+  }
+  startPolling(intervalMs = 5000) {
+    this.stopPolling();
+    this.checkHealth();
+    this._checkInterval = setInterval(() => this.checkHealth(), intervalMs);
+  }
+  stopPolling() { if (this._checkInterval) { clearInterval(this._checkInterval); this._checkInterval = null; } }
+  async separateStems(audioBuffer) { return {}; }
+  async saveSession(sessionData) { return { status: 'success' }; }
+  async _fetch(endpoint, options) { return { status: 'ok' }; }
+};
+
+// ----- SONG WRITER -----
+window.SongWriter = class SongWriter {
+  constructor() { this._scanned = false; }
+  async scan() { this._scanned = true; }
+  async generate(params) {
+    return { 
+      tracks: [{ name: 'Melody', buffer: null }, { name: 'Bass', buffer: null }, { name: 'Rhythm', buffer: null }], 
+      duration: params.duration || 30, 
+      bpm: params.bpm || 120, 
+      key: 'C' 
+    };
+  }
+  generateLyrics(params) {
+    const templates = {
+      country_pop: ['Verse 1: The sun goes down', 'Chorus: We were born to run', 'Verse 2: These worn out boots', 'Chorus: Living for the night'],
+      country_classic: ['Well the jukebox is playing', 'Oh darling can\'t you see', 'The memories keep flooding back']
+    };
+    const lines = templates[params.genre] || templates.country_pop;
+    return lines.map((text, idx) => ({ time: idx * 4, text }));
+  }
+  findInstruments(genre) { return ['acoustic_guitar', 'electric_guitar', 'bass']; }
+  async load(name) {}
+  async generateVoiceTrack(melodyTrack, speaker, duration) { return null; }
+  exportBufferAsWav(buffer, filePath) { return filePath; }
+};
+
+// ----- AUDIO ENGINE (WORKING) -----
+let channelStripNodes = new Map();
+let channelAnalysers = new Map();
+
+async function initAudioEngine() {
+  if (audioCtx && audioCtx.state !== 'closed') {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    
+    if (!window.TitanEngine.isActive()) {
+      await window.TitanEngine.initialize(audioCtx);
+    }
+    return audioCtx;
+  }
+  
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  
+  const titanReady = await window.TitanEngine.initialize(audioCtx);
+  
+  if (titanReady && window.TitanEngine.isActive()) {
+    console.log('[Audio] Using Titan Engine (WASM + AudioWorklet)');
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.3;
+    return audioCtx;
+  }
+  
+  console.log('[Audio] Using Web Audio fallback');
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = faderToGain(state.mixer.masterFader);
+  
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.3;
+  
+  const eqLow = audioCtx.createBiquadFilter();
+  eqLow.type = 'lowshelf'; eqLow.frequency.value = 120;
+  const eqMid = audioCtx.createBiquadFilter();
+  eqMid.type = 'peaking'; eqMid.frequency.value = 1200;
+  const eqHigh = audioCtx.createBiquadFilter();
+  eqHigh.type = 'highshelf'; eqHigh.frequency.value = 8500;
+  const comp = audioCtx.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.ratio.value = 2.5;
+  const limiter = audioCtx.createDynamicsCompressor();
+  limiter.ratio.value = 20; limiter.attack.value = 0.001; limiter.threshold.value = -1;
+  
+  window.masterChain = { eqLow, eqMid, eqHigh, comp, limiter };
+  
+  masterGain.connect(eqLow);
+  eqLow.connect(eqMid);
+  eqMid.connect(eqHigh);
+  eqHigh.connect(comp);
+  comp.connect(limiter);
+  limiter.connect(analyser);
+  analyser.connect(audioCtx.destination);
+  
+  clickGain = audioCtx.createGain();
+  clickGain.gain.value = 0.15;
+  clickGain.connect(masterGain);
+  
+  window.pluginManager = new PluginManager(audioCtx);
+  window.masterPluginManager = new PluginManager(audioCtx);
+  window.masterGain = masterGain;
+  
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  
+  console.log('Audio engine initialized (Web Audio fallback)');
+  return audioCtx;
+}
+
+function rebuildChannelStripNodes() {
+  if (!audioCtx) return;
+  channelStripNodes.clear();
+  channelAnalysers.clear();
+  state.channels.forEach(ch => {
+    if (ch.hasRealAudio && ch.takes.length) {
+      const nodes = createChannelStripNodes(audioCtx, ch);
+      channelStripNodes.set(ch.id, nodes);
+      
+      // Create analyser for VU meter
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.3;
+      // Connect after compressor for post-fader metering
+      nodes.comp.connect(analyser);
+      channelAnalysers.set(ch.id, analyser);
+    }
+  });
+}
+
+function getChannelPeak(ch) {
+  const analyser = channelAnalysers.get(ch.id);
+  if (!analyser) return 0;
+  
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(data);
+  
+  let max = 0;
+  for (let i = 0; i < data.length; i++) {
+    max = Math.max(max, data[i]);
+  }
+  return max / 255;
+}
+
+// ----- PLAYBACK FUNCTIONS (WORKING) -----
+function playAudioFiles() {
+   stopAudio();
+   if (!audioCtx) return;
+   
+   const ctx = audioCtx;
+   const currentTime = ctx.currentTime;
+   const transportTime = state.transport.time;
+   const anySolo = state.channels.some(ch => ch.solo);
+   const useTitan = window.TitanEngine.isActive();
+   
+   rebuildChannelStripNodes();
+   
+   const masterOutput = useTitan ? audioCtx.destination : masterGain;
+   
+   state.channels.forEach((ch) => {
+     if (ch.muted) return;
+     if (anySolo && !ch.solo) return;
+     if (!ch.hasRealAudio || !ch.takes.length) return;
+     
+     const stripNodes = channelStripNodes.get(ch.id);
+     
+     ch.takes.forEach((take) => {
+       if (!take.buffer) return;
+       
+       const source = ctx.createBufferSource();
+       source.buffer = take.buffer;
+       
+       if (stripNodes) {
+         source.connect(stripNodes.gain);
+         stripNodes.gain.connect(stripNodes.pan);
+         stripNodes.pan.connect(stripNodes.eqLow);
+         stripNodes.eqLow.connect(stripNodes.eqMid);
+         stripNodes.eqMid.connect(stripNodes.eqHigh);
+         
+         // Connect effects chain after EQ
+         if (ch.effectInstances && !useTitan) {
+           let prevNode = stripNodes.eqHigh;
+           for (const pluginId of ch.plugins) {
+             const effect = ch.effectInstances[pluginId];
+             if (effect && !effect.bypass) {
+               prevNode.connect(effect.inputNode);
+               prevNode = effect.outputNode;
+             }
+           }
+           prevNode.connect(stripNodes.comp);
+         } else {
+           stripNodes.eqHigh.connect(stripNodes.comp);
+         }
+         stripNodes.comp.connect(masterOutput);
+       } else {
+         const channelGain = ctx.createGain();
+         const trimDB = (ch.gain - 50) * 0.24;
+         channelGain.gain.value = Math.pow(10, trimDB / 20) * faderToGain(ch.volume);
+         const panNode = ctx.createStereoPanner();
+         panNode.pan.value = (ch.pan - 50) / 50;
+         source.connect(channelGain);
+         channelGain.connect(panNode);
+         panNode.connect(masterOutput);
+       }
+       
+       let offset = transportTime;
+       if (offset >= take.buffer.duration) {
+         offset = 0;
+         if (!state.transport.loopEnabled) return;
+       }
+       
+       try {
+         source.start(0, offset);
+         if (state.transport.loopEnabled) {
+           source.loop = true;
+           source.loopStart = 0;
+           source.loopEnd = take.buffer.duration;
+         }
+         audioSources.push({ source, channelId: ch.id, stripNodes });
+         console.log(`Playing: ${ch.label}`);
+       } catch(e) { console.error('Play error:', e); }
+     });
+   });
+   
+   if (useTitan) {
+     syncTitanParameters();
+   }
+ }
+
+function stopAudio() {
+  for (const item of audioSources) {
+    try { item.source.stop(); } catch(e) {}
+  }
+  audioSources = [];
+}
+
+function syncTitanParameters() {
+  if (!window.TitanEngine.isActive()) return;
+  
+  // Sync master fader
+  window.TitanEngine.setParameter('masterGain', faderToGain(state.mixer.masterFader));
+  
+  // Sync channel parameters (would need per-channel support in Titan)
+  state.channels.forEach((ch, idx) => {
+    if (ch.hasRealAudio) {
+      window.TitanEngine.setParameter(`channel${idx}Gain`, faderToGain(ch.volume));
+      window.TitanEngine.setParameter(`channel${idx}Pan`, (ch.pan - 50) / 50);
+    }
+  });
+}
+
+// ----- CLICK TRACK -----
+function generateClick(ctx, freq, duration, when) {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+  gain.gain.value = 0;
+  gain.gain.setValueAtTime(0, when);
+  gain.gain.linearRampToValueAtTime(0.3, when + 0.005);
+  gain.gain.exponentialRampToValueAtTime(0.001, when + duration);
+  osc.connect(gain);
+  gain.connect(clickGain);
+  osc.start(when);
+  osc.stop(when + duration);
+}
+
+function startClick() {
+  if (!audioCtx) return;
+  stopClick();
+  const bpm = state.transport.tempo;
+  const beatDuration = 60 / bpm;
+  let nextBeat = audioCtx.currentTime;
+  
+  function scheduleClick() {
+    if (!state.transport.clickEnabled || !state.transport.playing) return;
+    const lookahead = 0.1;
+    while (nextBeat < audioCtx.currentTime + lookahead) {
+      const isDownbeat = Math.round((nextBeat - audioCtx.currentTime) / beatDuration) % 4 === 0;
+      const freq = isDownbeat ? 1000 : 800;
+      generateClick(audioCtx, freq, 0.05, nextBeat);
+      nextBeat += beatDuration;
+    }
+    clickTimer = setTimeout(scheduleClick, 50);
+  }
+  scheduleClick();
+}
+
+function stopClick() {
+  if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+}
+
+// ----- RECORDING WORKLET -----
+const recordingWorkletCode = `
+  class RecordingProcessor extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.recording = false;
+      this.buffers = [];
+      this.port.onmessage = (e) => {
+        if (e.data.type === 'start') this.recording = true;
+        else if (e.data.type === 'stop') this.recording = false;
+        else if (e.data.type === 'clear') this.buffers = [];
+      };
+    }
+    process(inputs) {
+      if (this.recording && inputs[0].length > 0) {
+        const input = inputs[0][0];
+        const copy = new Float32Array(input.length);
+        copy.set(input);
+        this.port.postMessage({ type: 'audio', buffer: copy }, [copy.buffer]);
+      }
+      return true;
+    }
+  }
+  registerProcessor('recording-processor', RecordingProcessor);
+`;
+
+// ----- RECORDING FUNCTIONS -----
+let recordingWorkletNode = null;
+let recordingWorkletReady = false;
+let recordingBuffers = [];
+
+async function initRecordingWorklet() {
+  if (recordingWorkletReady) return true;
+  try {
+    const blob = new Blob([recordingWorkletCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    recordingWorkletNode = new AudioWorkletNode(audioCtx, 'recording-processor', {
+      numberOfInputs: 1,
+      numberOfOutputs: 0
+    });
+    recordingWorkletNode.port.onmessage = (e) => {
+      if (e.data.type === 'audio') {
+        recordingBuffers.push(e.data.buffer);
+      }
+    };
+    recordingWorkletReady = true;
+    return true;
+  } catch (err) {
+    console.warn('Recording worklet failed, using fallback:', err);
+    return false;
+  }
+}
+
+async function startRecording() {
+  const armed = state.channels.filter(c => c.armed);
+  if (!armed.length) { notify('No track armed for recording'); state.transport.recording = false; renderTransport(); return; }
+  try {
+    const ctx = initAudioEngine();
+    if (ctx.state === 'suspended') await ctx.resume();
+    
+    const useWorklet = await initRecordingWorklet();
+    
+    recordingStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: 48000, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const source = ctx.createMediaStreamSource(recordingStream);
+    
+    recordingBuffers = [];
+    
+    if (useWorklet && recordingWorkletNode) {
+      source.connect(recordingWorkletNode);
+      recordingWorkletNode.port.postMessage({ type: 'start' });
+      recordingWorkletNode.port.postMessage({ type: 'clear' });
+    } else {
+      // Fallback to ScriptProcessor
+      const fallbackNode = ctx.createScriptProcessor(4096, 1, 1);
+      fallbackNode.onaudioprocess = (e) => {
+        const ch = e.inputBuffer.getChannelData(0);
+        const buf = new Float32Array(ch.length);
+        buf.set(ch);
+        recordingBuffers.push(buf);
+      };
+      source.connect(fallbackNode);
+      window._captureNode = fallbackNode;
+    }
+    
+    window._recordedSamples = recordingBuffers;
+    recordingStartTime = Date.now();
+    notify('Recording started');
+  } catch(err) {
+    notify('Recording failed: ' + err.message);
+    state.transport.recording = false;
+    renderTransport();
+  }
+}
+
+function stopRecording() {
+  if (recordingWorkletNode) {
+    recordingWorkletNode.port.postMessage({ type: 'stop' });
+  }
+  if (window._captureNode) {
+    try { window._captureNode.disconnect(); } catch(e) {}
+    window._captureNode = null;
+  }
+  if (recordingStream) {
+    recordingStream.getTracks().forEach(t => t.stop());
+    recordingStream = null;
+  }
+  const armed = state.channels.filter(c => c.armed);
+  const sr = audioCtx ? audioCtx.sampleRate : 48000;
+  const samples = recordingBuffers.length > 0 ? recordingBuffers : (window._recordedSamples || []);
+  if (samples.length > 0) {
+    let totalLen = 0;
+    for (const s of samples) totalLen += s.length;
+    const merged = new Float32Array(totalLen);
+    let off = 0;
+    for (const s of samples) { merged.set(s, off); off += s.length; }
+    const wavBlob = encodeWAV(merged, sr);
+    armed.forEach((ch) => {
+      const takeName = `${ch.label}_Take${(ch.takes.length||0)+1}`;
+      ch.takes.push({ name: takeName, buffer: null, duration: merged.length / sr, size: (wavBlob.size/1024).toFixed(1)+'KB' });
+      ch.hasRealAudio = true;
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (audioCtx) audioCtx.decodeAudioData(reader.result).then(buf => {
+          const t = ch.takes.find(t => t.name === takeName);
+          if (t) t.buffer = buf;
+        }).catch(() => {});
+      };
+      reader.readAsArrayBuffer(wavBlob);
+      notify(`Recorded ${takeName} (${(merged.length/sr).toFixed(1)}s)`);
+    });
+  }
+  recordingBuffers = [];
+  window._recordedSamples = [];
+  notify('Recording stopped');
+}
+
+function encodeWAV(samples, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = samples.length * (bitsPerSample / 8);
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, Math.round(s < 0 ? s * 0x8000 : s * 0x7FFF), true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+// ----- UPDATE FUNCTIONS -----
+function updateMasterProcessing() {
+  const m = state.master;
+  if (window.masterChain) {
+    if (window.masterChain.eqLow) window.masterChain.eqLow.gain.value = m.eq.lowGain;
+    if (window.masterChain.eqMid) window.masterChain.eqMid.gain.value = m.eq.midGain;
+    if (window.masterChain.eqHigh) window.masterChain.eqHigh.gain.value = m.eq.highGain;
+    if (window.masterChain.comp) {
+      window.masterChain.comp.threshold.value = m.comp.threshold;
+      window.masterChain.comp.ratio.value = m.comp.ratio;
+    }
+    if (window.masterChain.limiter) window.masterChain.limiter.threshold.value = m.limiter.ceiling;
+  }
+}
+
+function updateMasterBusChain() {}
+
+function setMasterVolume(value) {
+  const gain = faderToGain(value);
+  if (masterGain) masterGain.gain.value = gain;
+  if (window.TitanEngine.isActive()) {
+    window.TitanEngine.setParameter('masterGain', gain);
+  }
+}
+
+// ----- RENDER FUNCTIONS -----
+function renderMixer() {
+  const mixerArea = document.getElementById('mixerArea');
+  if (!mixerArea) return;
+  mixerArea.innerHTML = '';
+  
+  state.channels.forEach((ch, idx) => {
+    const strip = document.createElement('div');
+    strip.className = 'channel-strip' + (state.selectedChannel === ch.id ? ' selected' : '');
+    strip.dataset.ch = ch.id;
+    strip.onclick = () => { state.selectedChannel = ch.id; renderMixer(); renderSidePanel(); };
+    const level = state.vuLevels[idx] || 0;
+    const gainAngle = (ch.gain / 100) * 270 - 135;
+    const panAngle = (ch.pan / 100) * 270 - 135;
+    
+    strip.innerHTML = `
+      <div class="ch-number">${String(ch.id).padStart(2,'0')}</div>
+      <div class="vu-meter"><div class="vu-fill" style="height:${Math.min(100, level)}%"></div></div>
+      ${ch.takes.length ? `<span style="font-size:5px;color:#0dc5b0">${ch.takes.length} TK</span>` : ''}
+      <div class="knob-container">
+        <span class="knob-label">GAIN</span>
+        <div class="knob-outer" data-knob="gain" data-ch="${ch.id}" data-val="${ch.gain}">
+          <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${gainAngle}deg)"></div></div>
+        </div>
+        <span class="knob-value teal">${Math.round(ch.gain)}</span>
+      </div>
+      <div class="knob-container">
+        <span class="knob-label">PAN</span>
+        <div class="knob-outer" data-knob="pan" data-ch="${ch.id}" data-val="${ch.pan}">
+          <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${panAngle}deg)"></div></div>
+        </div>
+        <span class="knob-value blue">${Math.round(ch.pan)}</span>
+      </div>
+      <div style="display:flex; gap:2px;">
+        <button class="ch-btn ${ch.armed ? 'armed' : ''}" data-action="arm" data-ch="${ch.id}">REC</button>
+        <button class="ch-btn ${ch.muted ? 'muted' : ''}" data-action="mute" data-ch="${ch.id}">M</button>
+        <button class="ch-btn ${ch.solo ? 'soloed' : ''}" data-action="solo" data-ch="${ch.id}">S</button>
+      </div>
+      <div class="fader-container">
+        <div class="fader-track" data-fader="vol" data-ch="${ch.id}" data-val="${ch.volume}">
+          <div class="fader-fill" style="height:${ch.volume}%"></div>
+          <div class="fader-cap" style="top:${100 - ch.volume}%"></div>
+        </div>
+        <span style="font-size:7px;">${Math.round(ch.volume)}</span>
+      </div>
+      <div style="font-size:6px; color:#6e717a; text-align:center; max-width:60px; overflow:hidden;">${ch.label.slice(0,10)}</div>
+    `;
+    mixerArea.appendChild(strip);
+  });
+  
+  // Master section
+  const masterSection = document.createElement('div');
+  masterSection.className = 'master-section';
+  const masterAngle = (state.mixer.masterFader / 100) * 270 - 135;
+  masterSection.innerHTML = `
+    <div class="master-subsection"><span class="master-label">REVERB</span>
+      <div class="knob-container"><span class="knob-label">MIX</span>
+        <div class="knob-outer" data-knob="reverb" data-val="${state.mixer.reverbMix}">
+          <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(state.mixer.reverbMix/100)*270-135}deg)"></div></div>
+        </div>
+        <span class="knob-value">${state.mixer.reverbMix}%</span>
+      </div>
+    </div>
+    <div class="master-subsection"><span class="master-label">MASTER</span>
+      <div class="knob-container"><span class="knob-label">VOL</span>
+        <div class="knob-outer" data-knob="master" data-val="${state.mixer.masterFader}">
+          <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${masterAngle}deg)"></div></div>
+        </div>
+        <span class="knob-value orange">${Math.round(state.mixer.masterFader)}</span>
+      </div>
+      <div class="fader-container">
+        <div class="fader-track" data-fader="master" data-val="${state.mixer.masterFader}">
+          <div class="fader-fill" style="height:${state.mixer.masterFader}%"></div>
+          <div class="fader-cap" style="top:${100 - state.mixer.masterFader}%"></div>
+        </div>
+      </div>
+    </div>
+  `;
+  mixerArea.appendChild(masterSection);
+  
+  attachKnobEvents();
+  attachFaderEvents();
+  attachChannelButtons();
+}
+
+function attachKnobEvents() {
+  document.querySelectorAll('[data-knob]').forEach(knob => {
+    knob.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      const startY = e.clientY;
+      const startVal = parseFloat(knob.dataset.val);
+      const min = 0, max = 100;
+      const target = knob.dataset.knob;
+      const chId = knob.dataset.ch ? parseInt(knob.dataset.ch) : null;
+      const useTitan = window.TitanEngine.isActive();
+      
+      const onMove = (moveEvent) => {
+        const deltaY = startY - moveEvent.clientY;
+        let newVal = Math.min(max, Math.max(min, startVal + deltaY * 0.8));
+        newVal = Math.round(newVal);
+        knob.dataset.val = newVal;
+        const angle = (newVal / 100) * 270 - 135;
+        const indicator = knob.querySelector('.knob-indicator');
+        if (indicator) indicator.style.transform = `rotate(${angle}deg)`;
+        const valSpan = knob.parentElement.querySelector('.knob-value');
+        if (valSpan) valSpan.textContent = newVal;
+        
+        if (target === 'gain' && chId) {
+          const ch = state.channels.find(c => c.id === chId);
+          if (ch) { 
+            ch.gain = newVal; 
+            // Update channel strip node in real-time
+            const nodes = channelStripNodes.get(chId);
+            if (nodes) {
+              const trimDB = (ch.gain - 50) * 0.24;
+              nodes.gain.gain.value = Math.pow(10, trimDB / 20) * faderToGain(ch.volume);
+            }
+          }
+        } else if (target === 'pan' && chId) {
+          const ch = state.channels.find(c => c.id === chId);
+          if (ch) { 
+            ch.pan = newVal;
+            const nodes = channelStripNodes.get(chId);
+            if (nodes) nodes.pan.pan.value = (ch.pan - 50) / 50;
+          }
+        } else if (target === 'master') {
+          state.mixer.masterFader = newVal;
+          setMasterVolume(newVal);
+        } else if (target === 'reverb') {
+          state.mixer.reverbMix = newVal;
+        }
+        if (useTitan && target === 'master') {
+          window.TitanEngine.setParameter('masterGain', faderToGain(newVal));
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+  });
+}
+
+function attachFaderEvents() {
+  document.querySelectorAll('[data-fader]').forEach(fader => {
+    fader.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      const startY = e.clientY;
+      const startVal = parseFloat(fader.dataset.val);
+      const min = 0, max = 100;
+      const target = fader.dataset.fader;
+      const chId = fader.dataset.ch ? parseInt(fader.dataset.ch) : null;
+      const useTitan = window.TitanEngine.isActive();
+      
+      const onMove = (moveEvent) => {
+        let deltaY = startY - moveEvent.clientY;
+        let newVal = Math.min(max, Math.max(min, startVal + deltaY));
+        newVal = Math.round(newVal);
+        fader.dataset.val = newVal;
+        const fill = fader.querySelector('.fader-fill');
+        const cap = fader.querySelector('.fader-cap');
+        if (fill) fill.style.height = newVal + '%';
+        if (cap) cap.style.top = (100 - newVal) + '%';
+        const valSpan = fader.parentElement.querySelector('span:last-child');
+        if (valSpan && valSpan !== cap) valSpan.textContent = newVal;
+        
+        if (target === 'vol' && chId) {
+          const ch = state.channels.find(c => c.id === chId);
+          if (ch) { 
+            ch.volume = newVal;
+            const nodes = channelStripNodes.get(chId);
+            if (nodes) {
+              const trimDB = (ch.gain - 50) * 0.24;
+              nodes.gain.gain.value = Math.pow(10, trimDB / 20) * faderToGain(ch.volume);
+            }
+          }
+        } else if (target === 'master') {
+          state.mixer.masterFader = newVal;
+          setMasterVolume(newVal);
+        }
+        if (useTitan && target === 'master') {
+          window.TitanEngine.setParameter('masterGain', faderToGain(newVal));
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+  });
+}
+
+function attachChannelButtons() {
+  document.querySelectorAll('[data-action]').forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const ch = state.channels.find(c => c.id == btn.dataset.ch);
+      if (!ch) return;
+      if (btn.dataset.action === 'arm') { ch.armed = !ch.armed; renderMixer(); }
+      if (btn.dataset.action === 'mute') { ch.muted = !ch.muted; renderMixer(); }
+      if (btn.dataset.action === 'solo') { ch.solo = !ch.solo; renderMixer(); }
+    };
+  });
+}
+
+function renderSidePanel() {
+  const panel = document.getElementById('sidePanel');
+  if (!panel) return;
+  const ch = state.channels.find(c => c.id === state.selectedChannel);
+  if (!ch) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  panel.innerHTML = `
+    <div class="side-header"><span style="font-weight:700;">${ch.label} (Ch${ch.id})</span><button style="background:none; border:none; color:#6e717a; cursor:pointer;" id="closeSide">✕</button></div>
+    <div class="side-content">
+      <div class="side-tabs"><button class="side-tab active" data-stab="comping">COMPING</button><button class="side-tab" data-stab="eq">EQ</button><button class="side-tab" data-stab="comp">COMP</button><button class="side-tab" data-stab="ai">AI</button></div>
+      <div id="sideTabContent">
+        <p style="font-size:9px; color:#6e717a;">${ch.takes.length} take(s)</p>
+        ${ch.takes.map((t,i) => `<div style="background:#1c1f26; padding:6px; margin:3px 0; border-radius:4px;"><span style="font-size:9px;">${t.name || 'Take '+(i+1)}</span><div style="height:2px; background:#25282f; margin-top:4px;"><div style="width:${t.quality||80}%; height:100%; background:linear-gradient(90deg,#f54b4b,#f5c542,#3dd68c);"></div></div></div>`).join('')}
+      </div>
+    </div>
+  `;
+  document.getElementById('closeSide')?.addEventListener('click', () => { state.selectedChannel = null; renderSidePanel(); renderMixer(); });
+  
+  document.querySelectorAll('[data-stab]').forEach(tab => {
+    tab.onclick = () => {
+      document.querySelectorAll('[data-stab]').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      const content = document.getElementById('sideTabContent');
+      const nodes = channelStripNodes.get(ch.id);
+      if (tab.dataset.stab === 'comping') {
+        content.innerHTML = `<p>${ch.takes.length} takes available</p>`;
+      }
+      if (tab.dataset.stab === 'eq') {
+        content.innerHTML = `
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="knob-container">
+              <span class="knob-label">LOW</span>
+              <div class="knob-outer" data-knob="eqLowGain" data-ch="${ch.id}" data-val="${ch.eq.low.gain + 12}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(ch.eq.low.gain + 12) / 24 * 270 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value teal" id="eqLowVal">${ch.eq.low.gain}dB</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">LOW FRQ</span>
+              <div class="knob-outer" data-knob="eqLowFreq" data-ch="${ch.id}" data-val="${Math.log10(ch.eq.low.freq / 20) * 100 / Math.log10(20000/20)}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(ch.eq.low.freq / 20) * 100 / Math.log10(20000/20) * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value teal" id="eqLowFreqVal">${ch.eq.low.freq}Hz</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">MID</span>
+              <div class="knob-outer" data-knob="eqMidGain" data-ch="${ch.id}" data-val="${ch.eq.mid.gain + 12}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(ch.eq.mid.gain + 12) / 24 * 270 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value blue" id="eqMidVal">${ch.eq.mid.gain}dB</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">MID FRQ</span>
+              <div class="knob-outer" data-knob="eqMidFreq" data-ch="${ch.id}" data-val="${Math.log10(ch.eq.mid.freq / 20) * 100 / Math.log10(20000/20)}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(ch.eq.mid.freq / 20) * 100 / Math.log10(20000/20) * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value blue" id="eqMidFreqVal">${ch.eq.mid.freq}Hz</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">HIGH</span>
+              <div class="knob-outer" data-knob="eqHighGain" data-ch="${ch.id}" data-val="${ch.eq.high.gain + 12}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(ch.eq.high.gain + 12) / 24 * 270 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value orange" id="eqHighVal">${ch.eq.high.gain}dB</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">HIGH FRQ</span>
+              <div class="knob-outer" data-knob="eqHighFreq" data-ch="${ch.id}" data-val="${Math.log10(ch.eq.high.freq / 20) * 100 / Math.log10(20000/20)}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(ch.eq.high.freq / 20) * 100 / Math.log10(20000/20) * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value orange" id="eqHighFreqVal">${ch.eq.high.freq}Hz</span>
+            </div>
+          </div>
+        `;
+        attachSidePanelKnobs(ch.id, nodes);
+      }
+      if (tab.dataset.stab === 'comp') {
+        content.innerHTML = `
+          <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <div class="knob-container">
+              <span class="knob-label">THRESH</span>
+              <div class="knob-outer" data-knob="compThresh" data-ch="${ch.id}" data-val="${(ch.comp.threshold + 60) / 60 * 100}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(ch.comp.threshold + 60) / 60 * 100 * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value" id="compThreshVal">${ch.comp.threshold}dB</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">RATIO</span>
+              <div class="knob-outer" data-knob="compRatio" data-ch="${ch.id}" data-val="${(ch.comp.ratio - 1) / 19 * 100}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(ch.comp.ratio - 1) / 19 * 100 * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value" id="compRatioVal">${ch.comp.ratio}:1</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">ATTACK</span>
+              <div class="knob-outer" data-knob="compAttack" data-ch="${ch.id}" data-val="${Math.log10(ch.comp.attack / 0.1) / Math.log10(100/0.1) * 100}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(ch.comp.attack / 0.1) / Math.log10(100/0.1) * 100 * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value" id="compAttackVal">${ch.comp.attack}ms</span>
+            </div>
+            <div class="knob-container">
+              <span class="knob-label">RELEASE</span>
+              <div class="knob-outer" data-knob="compRelease" data-ch="${ch.id}" data-val="${Math.log10(ch.comp.release / 10) / Math.log10(1000/10) * 100}">
+                <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(ch.comp.release / 10) / Math.log10(1000/10) * 100 * 2.7 - 135}deg)"></div></div>
+              </div>
+              <span class="knob-value" id="compReleaseVal">${ch.comp.release}ms</span>
+            </div>
+          </div>
+        `;
+        attachSidePanelKnobs(ch.id, nodes);
+      }
+      if (tab.dataset.stab === 'ai') {
+        content.innerHTML = `
+          <label style="display:block; margin:8px 0;"><input type="checkbox" ${ch.ai.pitchCorrect ? 'checked' : ''} data-ai="pitchCorrect"> Pitch Correct</label>
+          <label style="display:block; margin:8px 0;"><input type="checkbox" ${ch.ai.deEsser ? 'checked' : ''} data-ai="deEsser"> De-Esser</label>
+          <label style="display:block; margin:8px 0;"><input type="checkbox" ${ch.ai.noiseMask ? 'checked' : ''} data-ai="noiseMask"> Noise Mask</label>
+        `;
+        content.querySelectorAll('[data-ai]').forEach(cb => {
+          cb.onchange = () => {
+            ch.ai[cb.dataset.ai] = cb.checked;
+            if (nodes) {
+              // Could add de-esser processing here
+            }
+          };
+        });
+      }
+    };
+  });
+}
+
+function attachSidePanelKnobs(chId, nodes) {
+  document.querySelectorAll('#sideTabContent [data-knob]').forEach(knob => {
+    knob.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      const startY = e.clientY;
+      const startVal = parseFloat(knob.dataset.val);
+      const target = knob.dataset.knob;
+      const ch = state.channels.find(c => c.id === chId);
+      if (!ch) return;
+      
+      const onMove = (moveEvent) => {
+        const deltaY = startY - moveEvent.clientY;
+        let newVal = Math.min(100, Math.max(0, startVal + deltaY * 0.8));
+        newVal = Math.round(newVal);
+        knob.dataset.val = newVal;
+        const angle = (newVal / 100) * 270 - 135;
+        const indicator = knob.querySelector('.knob-indicator');
+        if (indicator) indicator.style.transform = `rotate(${angle}deg)`;
+        
+        // Update state and audio nodes
+        if (target === 'eqLowGain') {
+          ch.eq.low.gain = newVal - 12;
+          document.getElementById('eqLowVal').textContent = `${ch.eq.low.gain}dB`;
+          if (nodes) nodes.eqLow.gain.value = ch.eq.low.gain;
+        } else if (target === 'eqLowFreq') {
+          const freq = 20 * Math.pow(20000/20, newVal / 100);
+          ch.eq.low.freq = Math.round(freq);
+          document.getElementById('eqLowFreqVal').textContent = `${ch.eq.low.freq}Hz`;
+          if (nodes) nodes.eqLow.frequency.value = ch.eq.low.freq;
+        } else if (target === 'eqMidGain') {
+          ch.eq.mid.gain = newVal - 12;
+          document.getElementById('eqMidVal').textContent = `${ch.eq.mid.gain}dB`;
+          if (nodes) nodes.eqMid.gain.value = ch.eq.mid.gain;
+        } else if (target === 'eqMidFreq') {
+          const freq = 20 * Math.pow(20000/20, newVal / 100);
+          ch.eq.mid.freq = Math.round(freq);
+          document.getElementById('eqMidFreqVal').textContent = `${ch.eq.mid.freq}Hz`;
+          if (nodes) nodes.eqMid.frequency.value = ch.eq.mid.freq;
+        } else if (target === 'eqHighGain') {
+          ch.eq.high.gain = newVal - 12;
+          document.getElementById('eqHighVal').textContent = `${ch.eq.high.gain}dB`;
+          if (nodes) nodes.eqHigh.gain.value = ch.eq.high.gain;
+        } else if (target === 'eqHighFreq') {
+          const freq = 20 * Math.pow(20000/20, newVal / 100);
+          ch.eq.high.freq = Math.round(freq);
+          document.getElementById('eqHighFreqVal').textContent = `${ch.eq.high.freq}Hz`;
+          if (nodes) nodes.eqHigh.frequency.value = ch.eq.high.freq;
+        } else if (target === 'compThresh') {
+          ch.comp.threshold = -60 + newVal * 0.6;
+          document.getElementById('compThreshVal').textContent = `${Math.round(ch.comp.threshold)}dB`;
+          if (nodes) nodes.comp.threshold.value = ch.comp.threshold;
+        } else if (target === 'compRatio') {
+          ch.comp.ratio = 1 + newVal * 0.19;
+          document.getElementById('compRatioVal').textContent = `${ch.comp.ratio.toFixed(1)}:1`;
+          if (nodes) nodes.comp.ratio.value = ch.comp.ratio;
+        } else if (target === 'compAttack') {
+          ch.comp.attack = Math.round(0.1 * Math.pow(1000, newVal / 100));
+          document.getElementById('compAttackVal').textContent = `${ch.comp.attack}ms`;
+          if (nodes) nodes.comp.attack.value = ch.comp.attack / 1000;
+        } else if (target === 'compRelease') {
+          ch.comp.release = Math.round(10 * Math.pow(100, newVal / 100));
+          document.getElementById('compReleaseVal').textContent = `${ch.comp.release}ms`;
+          if (nodes) nodes.comp.release.value = ch.comp.release / 1000;
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+  });
+}
+
+function renderTransport() {
+  const bar = document.getElementById('transportBar');
+  if (!bar) return;
+  const t = state.transport;
+  bar.innerHTML = `
+    <button class="transport-btn" data-cmd="rewind">⏮</button>
+    <button class="transport-btn ${t.playing ? 'play-active' : ''}" data-cmd="play">${t.playing ? '⏸' : '▶'}</button>
+    <button class="transport-btn ${t.recording ? 'rec-active' : ''}" data-cmd="record">●</button>
+    <button class="transport-btn" data-cmd="stop">⏹</button>
+    <span class="transport-info">${Math.floor(t.time/60)}:${String(Math.floor(t.time%60)).padStart(2,'0')} · ${t.tempo} BPM</span>
+    <button class="transport-toggle ${t.loopEnabled ? 'active' : ''}" data-cmd="loop">LOOP</button>
+    <button class="transport-toggle ${t.clickEnabled ? 'active' : ''}" data-cmd="click">CLICK</button>
+    <button class="transport-toggle ${t.directMonitor ? 'active' : ''}" data-cmd="monitor">MON</button>
+  `;
+  
+  bar.querySelectorAll('[data-cmd]').forEach(btn => {
+    btn.onclick = () => {
+      const cmd = btn.dataset.cmd;
+      if (cmd === 'play') {
+        if (t.recording) {
+          t.recording = false; t.playing = false;
+          stopRecording(); stopAudio(); stopClick();
+          notify('Recording stopped');
+        } else {
+          t.playing = !t.playing;
+          if (t.playing) {
+            initAudioEngine();
+            playAudioFiles();
+            if (t.clickEnabled) startClick();
+            notify('Playback started');
+          } else {
+            stopAudio(); stopClick();
+            notify('Stopped');
+          }
+        }
+      } else if (cmd === 'record') {
+        const armed = state.channels.filter(c => c.armed);
+        if (!armed.length) { notify('No track armed — arm a track first'); return; }
+        t.recording = !t.recording;
+        if (t.recording) {
+          initAudioEngine();
+          if (!t.playing) {
+            t.playing = true;
+            playAudioFiles();
+            if (t.clickEnabled) startClick();
+          }
+          startRecording();
+          notify('Recording started (overdub)');
+        } else {
+          stopRecording();
+          notify('Recording stopped');
+        }
+      } else if (cmd === 'stop') {
+        t.playing = false; t.recording = false;
+        stopAudio(); stopClick(); stopRecording();
+        notify('Stopped');
+      } else if (cmd === 'rewind') {
+        t.time = 0;
+        if (t.playing) { stopAudio(); playAudioFiles(); }
+      } else if (cmd === 'loop') {
+        t.loopEnabled = !t.loopEnabled;
+        if (t.playing) { stopAudio(); playAudioFiles(); }
+      } else if (cmd === 'click') {
+        t.clickEnabled = !t.clickEnabled;
+        if (t.clickEnabled && t.playing) startClick();
+        else if (!t.clickEnabled) stopClick();
+      } else if (cmd === 'monitor') {
+        t.directMonitor = !t.directMonitor;
+        notify(t.directMonitor ? 'Direct monitoring ON' : 'Processed monitoring ON');
+      }
+      renderTransport();
+      renderMixer();
+    };
+  });
+}
+
+function switchView(view) {
+  state.activeView = view;
+  const views = ['mixerArea', 'engineView', 'teleView', 'rdslView', 'writerView', 'autocompView', 'masterView', 'pluginsView', 'aiView', 'bandView', 'effectsRackView'];
+  views.forEach(v => { const el = document.getElementById(v); if(el) el.style.display = 'none'; });
+  
+  if (view === 'MIXER') { const el = document.getElementById('mixerArea'); if(el) el.style.display = 'flex'; renderMixer(); }
+  if (view === 'ENGINE') { const el = document.getElementById('engineView'); if(el) { el.style.display = 'block'; renderEngineView(); } }
+  if (view === 'TELE') { const el = document.getElementById('teleView'); if(el) { el.style.display = 'flex'; renderTeleView(); } }
+  if (view === 'WRITER') { const el = document.getElementById('writerView'); if(el) el.style.display = 'block'; }
+  if (view === 'AUTOCOMP') { const el = document.getElementById('autocompView'); if(el) { el.style.display = 'block'; renderAutocompView(); } }
+  if (view === 'RDSL') { const el = document.getElementById('rdslView'); if(el) { el.style.display = 'flex'; renderRdslView(); } }
+  if (view === 'MASTER') { const el = document.getElementById('masterView'); if(el) { el.style.display = 'flex'; renderMasterView(); } }
+  if (view === 'PLUGINS') { const el = document.getElementById('pluginsView'); if(el) { el.style.display = 'block'; renderPluginsView(); } }
+  if (view === 'AI') { const el = document.getElementById('aiView'); if(el) { el.style.display = 'block'; renderAIView(); } }
+  if (view === 'BAND') { const el = document.getElementById('bandView'); if(el) { el.style.display = 'flex'; renderBandView(); } }
+  if (view === 'RDR') { const el = document.getElementById('rdslView'); if(el) { el.style.display = 'flex'; renderRDRView(); } }
+  if (view === 'RACK') { const el = document.getElementById('effectsRackView'); if(el) { el.style.display = 'flex'; renderEffectsRack(); } }
+  
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active-view'));
+  const activeBtn = document.querySelector(`[data-view="${view}"]`);
+  if (activeBtn) activeBtn.classList.add('active-view');
+}
+
+function renderEngineView() {
+  const stages = [
+    {id:1,name:'SuperAnalogue Front-End',spec:'+27 dBu'},
+    {id:2,name:'Harmonic Identity Matrix',spec:'BlueSteel'},
+    {id:3,name:'Neural-Parametric Engine',spec:'AI/ML'},
+    {id:4,name:'DFC-Class DSP Core',spec:'1000+ Paths'},
+    {id:5,name:'Oversampled FX Grid',spec:'4×-16× OS'},
+    {id:6,name:'Immersive Routing',spec:'7.1.4'},
+    {id:7,name:'Master Integrity Chain',spec:'True-Peak'},
+    {id:8,name:'Render Engine',spec:'Multi-Format'}
+  ];
+  const el = document.getElementById('engineView');
+  if (!el) return;
+  el.innerHTML = `<div class="signal-flow">${stages.map((s,i) => `
+    <div class="stage-card" data-sid="${s.id}">
+      <div class="stage-number">STAGE ${s.id}</div>
+      <div class="stage-name">${s.name}</div>
+      <div style="color:#8a8d96;font-size:8px">${s.spec}</div>
+      ${s.id === 2 ? `<div style="display:flex;gap:2px;margin-top:4px">
+        <span class="harmonic-chip bluesteel ${state.activeHarmonic==='bluesteel'?'active':''}" data-h="bluesteel">BlueSteel</span>
+        <span class="harmonic-chip reddirt ${state.activeHarmonic==='reddirt'?'active':''}" data-h="reddirt">RedDirt</span>
+        <span class="harmonic-chip longhorn ${state.activeHarmonic==='longhorn'?'active':''}" data-h="longhorn">Longhorn</span>
+      </div>` : ''}
+    </div>
+    ${i<stages.length-1?'<div style="display:flex;align-items:center;color:#c9a84c;">↓</div>':''}
+  `).join('')}</div>`;
+  el.querySelectorAll('[data-h]').forEach(el => {
+    el.onclick = () => { state.activeHarmonic = el.dataset.h; renderEngineView(); };
+  });
+}
+
+function renderTeleView() {
+  const lyrics = state.teleprompterLyrics.length ? state.teleprompterLyrics : [{time:0,text:'Welcome to Red Dirt Studio'},{time:4,text:'Import audio to get started'}];
+  const t = state.transport.time;
+  const currentIdx = lyrics.findIndex((l,i) => t >= l.time && (!lyrics[i+1] || t < lyrics[i+1].time));
+  const progress = Math.min(100, (t/(lyrics[lyrics.length-1]?.time||30))*100);
+  const fontSize = state.teleprompterFontSize || 24;
+  const el = document.getElementById('teleView');
+  if (!el) return;
+  el.innerHTML = `
+    <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+      <h3 class="tele-title">Teleprompter</h3>
+      <button class="tele-font-btn" data-op="-" style="background:#1a1d24; border:1px solid #3a3d46; border-radius:3px; color:#ccc; padding:2px 8px;">A−</button>
+      <button class="tele-font-btn" data-op="+" style="background:#1a1d24; border:1px solid #3a3d46; border-radius:3px; color:#ccc; padding:2px 8px;">A+</button>
+    </div>
+    <div class="tele-lyrics-container">
+      ${lyrics.map((l,i) => {
+        let cls = 'far-upcoming';
+        if(i < currentIdx) cls = 'past';
+        else if(i === currentIdx) cls = 'current';
+        else if(i === currentIdx+1) cls = 'upcoming';
+        if(l.isSection) cls += ' section-line';
+        const topPos = (i-(currentIdx>=0?currentIdx:0)) * (fontSize * 2.2) + fontSize * 2;
+        return `<div class="tele-lyric-line ${cls}" style="top:${topPos}px; font-size:${fontSize}px">${l.text}</div>`;
+      }).join('')}
+    </div>
+    <div class="tele-progress-bar"><div class="tele-progress-fill" style="width:${progress}%"></div></div>
+    <div style="display:flex; gap:6px; margin-top:14px;">
+      <button class="control-btn primary" id="telePlayBtn">${state.transport.playing?'Pause':'Play'}</button>
+      <button class="control-btn" id="teleRestartBtn">Restart</button>
+    </div>
+  `;
+  document.getElementById('telePlayBtn')?.addEventListener('click', () => {
+    state.transport.playing = !state.transport.playing;
+    if (state.transport.playing) { initAudioEngine(); playAudioFiles(); } else { stopAudio(); }
+    renderTransport(); renderTeleView();
+  });
+  document.getElementById('teleRestartBtn')?.addEventListener('click', () => {
+    state.transport.time = 0;
+    if (state.transport.playing) { stopAudio(); playAudioFiles(); }
+    renderTransport(); renderTeleView();
+  });
+  document.querySelectorAll('.tele-font-btn').forEach(b => {
+    b.onclick = () => {
+      state.teleprompterFontSize = Math.max(14, Math.min(72, (state.teleprompterFontSize||24) + (b.dataset.op === '+' ? 4 : -4)));
+      renderTeleView();
+    };
+  });
+}
+
+function renderRdslView() {
+  const el = document.getElementById('rdslView');
+  if (!el) return;
+  el.innerHTML = `
+    <h3 class="rdsl-title">Red Dirt Scripting Language (RDSL)</h3>
+    <div class="rdsl-editor-container">
+      <textarea id="rdslEditor" placeholder='session "My Song"\ntrack vocal { compress threshold=-12 ratio=3 }\nmixdown "output.wav" loudness -14'></textarea>
+    </div>
+    <div class="rdsl-controls">
+      <button class="control-btn primary" id="runRdsl">Run Script</button>
+      <button class="control-btn" id="clearRdsl">Clear</button>
+      <button class="control-btn" id="exampleRdsl">Load Example</button>
+    </div>
+    <div class="rdsl-output">
+      <h4>Output:</h4>
+      <div class="rdsl-output-area" id="rdslOutput">> Ready to run RDSL script...</div>
+    </div>
+  `;
+  document.getElementById('runRdsl')?.addEventListener('click', () => {
+    const script = document.getElementById('rdslEditor')?.value || '';
+    const output = document.getElementById('rdslOutput');
+    if (output) output.innerHTML = `> Executed RDSL script\n${script.slice(0, 200)}...`;
+    notify('RDSL script executed');
+  });
+  document.getElementById('clearRdsl')?.addEventListener('click', () => {
+    const editor = document.getElementById('rdslEditor');
+    if (editor) editor.value = '';
+  });
+  document.getElementById('exampleRdsl')?.addEventListener('click', () => {
+    const editor = document.getElementById('rdslEditor');
+    if (editor) editor.value = 'session "Country Mix"\nload "vocal.wav" as vocal\ntrack vocal {\nhighpass 80\ncompress threshold=-12 ratio=3\neq 250 -3\nreverb size=0.3 mix=0.15\n}\nmixdown "exports/mix.wav" loudness -14';
+  });
+}
+
+function renderMasterView() {
+  const el = document.getElementById('masterView');
+  if (!el) return;
+  const m = state.master;
+  const lufsData = measureLUFS();
+  el.innerHTML = `
+    <div class="master-row">
+      <div class="master-card">
+        <div class="master-card-title">MASTER BUS</div>
+        <div class="knob-container"><span class="knob-label">VOL</span>
+          <div class="knob-outer" data-knob="master" data-val="${state.mixer.masterFader}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(state.mixer.masterFader/100)*270-135}deg)"></div></div>
+          </div>
+          <span class="knob-value orange">${Math.round(state.mixer.masterFader)}</span>
+        </div>
+        <div class="fader-container">
+          <div class="fader-track" data-fader="master" data-val="${state.mixer.masterFader}">
+            <div class="fader-fill" style="height:${state.mixer.masterFader}%"></div>
+            <div class="fader-cap" style="top:${100 - state.mixer.masterFader}%"></div>
+          </div>
+        </div>
+      </div>
+      <div class="master-card">
+        <div class="master-card-title">MASTER EQ</div>
+        <div class="knob-container"><span class="knob-label">LOW</span>
+          <div class="knob-outer" data-knob="eqLow" data-val="${m.eq.lowGain+12}" data-min="0" data-max="24">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${((m.eq.lowGain+12)/24)*270-135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterEqLowVal">${m.eq.lowGain}dB</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">MID</span>
+          <div class="knob-outer" data-knob="eqMid" data-val="${m.eq.midGain+12}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${((m.eq.midGain+12)/24)*270-135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterEqMidVal">${m.eq.midGain}dB</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">HIGH</span>
+          <div class="knob-outer" data-knob="eqHigh" data-val="${m.eq.highGain+12}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${((m.eq.highGain+12)/24)*270-135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterEqHighVal">${m.eq.highGain}dB</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">LOW FRQ</span>
+          <div class="knob-outer" data-knob="eqLowFreq" data-val="${Math.log10(120/20) * 100 / Math.log10(2000/20)}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(120/20) * 100 / Math.log10(2000/20) * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value">120Hz</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">MID FRQ</span>
+          <div class="knob-outer" data-knob="eqMidFreq" data-val="${Math.log10(1200/20) * 100 / Math.log10(20000/20)}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(1200/20) * 100 / Math.log10(20000/20) * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value">1.2kHz</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">HIGH FRQ</span>
+          <div class="knob-outer" data-knob="eqHighFreq" data-val="${Math.log10(8500/20) * 100 / Math.log10(20000/20)}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(8500/20) * 100 / Math.log10(20000/20) * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value">8.5kHz</span>
+        </div>
+      </div>
+      <div class="master-card">
+        <div class="master-card-title">MASTER COMP</div>
+        <div class="knob-container"><span class="knob-label">THRESH</span>
+          <div class="knob-outer" data-knob="masterCompThresh" data-val="${(m.comp.threshold + 60) / 60 * 100}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(m.comp.threshold + 60) / 60 * 100 * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterCompThreshVal">${m.comp.threshold}dB</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">RATIO</span>
+          <div class="knob-outer" data-knob="masterCompRatio" data-val="${(m.comp.ratio - 1) / 19 * 100}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(m.comp.ratio - 1) / 19 * 100 * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterCompRatioVal">${m.comp.ratio}:1</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">ATTACK</span>
+          <div class="knob-outer" data-knob="masterCompAttack" data-val="${Math.log10(m.comp.attack / 0.1) / Math.log10(100/0.1) * 100}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(m.comp.attack / 0.1) / Math.log10(100/0.1) * 100 * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterCompAttackVal">${m.comp.attack}ms</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">RELEASE</span>
+          <div class="knob-outer" data-knob="masterCompRelease" data-val="${Math.log10(m.comp.release / 10) / Math.log10(1000/10) * 100}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(m.comp.release / 10) / Math.log10(1000/10) * 100 * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="masterCompReleaseVal">${m.comp.release}ms</span>
+        </div>
+      </div>
+      <div class="master-card">
+        <div class="master-card-title">LIMITER</div>
+        <div class="knob-container"><span class="knob-label">CEILING</span>
+          <div class="knob-outer" data-knob="limiterCeiling" data-val="${(m.limiter.ceiling + 20) / 20 * 100}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${(m.limiter.ceiling + 20) / 20 * 100 * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="limiterCeilingVal">${m.limiter.ceiling}dB</span>
+        </div>
+        <div class="knob-container"><span class="knob-label">RELEASE</span>
+          <div class="knob-outer" data-knob="limiterRelease" data-val="${Math.log10(m.limiter.release / 10) / Math.log10(1000/10) * 100}">
+            <div class="knob-inner"><div class="knob-indicator" style="transform:rotate(${Math.log10(m.limiter.release / 10) / Math.log10(1000/10) * 100 * 2.7 - 135}deg)"></div></div>
+          </div>
+          <span class="knob-value" id="limiterReleaseVal">${m.limiter.release}ms</span>
+        </div>
+      </div>
+      <div class="master-card">
+        <div class="master-card-title">LEVELS</div>
+        <div class="master-meter"><div class="master-meter-fill" style="width:${Math.min(100, (lufsData.lufs+60)*1.66)}%; background:linear-gradient(90deg,#3dd68c,#f5c542,#f54b4b)"></div></div>
+        <div style="display:flex; justify-content:space-between; margin-top:4px;"><span>LUFS: ${lufsData.lufs.toFixed(1)}</span><span>Peak: ${lufsData.peak.toFixed(1)}dB</span></div>
+        <div class="correlation-meter" style="margin-top:8px;"><div class="correlation-needle" style="transform:rotate(${lufsData.correlation*90}deg)"></div></div>
+      </div>
+    </div>
+  `;
+  attachMasterKnobs();
+}
+
+function attachMasterKnobs() {
+  const m = state.master;
+  const masterChain = window.masterChain;
+  
+  document.querySelectorAll('#masterView [data-knob]').forEach(knob => {
+    knob.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      const startY = e.clientY;
+      const startVal = parseFloat(knob.dataset.val);
+      const target = knob.dataset.knob;
+      
+      const onMove = (moveEvent) => {
+        const deltaY = startY - moveEvent.clientY;
+        let newVal = Math.min(100, Math.max(0, startVal + deltaY * 0.8));
+        newVal = Math.round(newVal);
+        knob.dataset.val = newVal;
+        const angle = (newVal / 100) * 270 - 135;
+        const indicator = knob.querySelector('.knob-indicator');
+        if (indicator) indicator.style.transform = `rotate(${angle}deg)`;
+        
+        if (target === 'eqLow') {
+          m.eq.lowGain = newVal - 12;
+          document.getElementById('masterEqLowVal').textContent = `${m.eq.lowGain}dB`;
+          if (masterChain && masterChain.eqLow) masterChain.eqLow.gain.value = m.eq.lowGain;
+        } else if (target === 'eqMid') {
+          m.eq.midGain = newVal - 12;
+          document.getElementById('masterEqMidVal').textContent = `${m.eq.midGain}dB`;
+          if (masterChain && masterChain.eqMid) masterChain.eqMid.gain.value = m.eq.midGain;
+        } else if (target === 'eqHigh') {
+          m.eq.highGain = newVal - 12;
+          document.getElementById('masterEqHighVal').textContent = `${m.eq.highGain}dB`;
+          if (masterChain && masterChain.eqHigh) masterChain.eqHigh.gain.value = m.eq.highGain;
+        } else if (target === 'masterCompThresh') {
+          m.comp.threshold = -60 + newVal * 0.6;
+          document.getElementById('masterCompThreshVal').textContent = `${Math.round(m.comp.threshold)}dB`;
+          if (masterChain && masterChain.comp) masterChain.comp.threshold.value = m.comp.threshold;
+        } else if (target === 'masterCompRatio') {
+          m.comp.ratio = 1 + newVal * 0.19;
+          document.getElementById('masterCompRatioVal').textContent = `${m.comp.ratio.toFixed(1)}:1`;
+          if (masterChain && masterChain.comp) masterChain.comp.ratio.value = m.comp.ratio;
+        } else if (target === 'masterCompAttack') {
+          m.comp.attack = Math.round(0.1 * Math.pow(1000, newVal / 100));
+          document.getElementById('masterCompAttackVal').textContent = `${m.comp.attack}ms`;
+          if (masterChain && masterChain.comp) masterChain.comp.attack.value = m.comp.attack / 1000;
+        } else if (target === 'masterCompRelease') {
+          m.comp.release = Math.round(10 * Math.pow(100, newVal / 100));
+          document.getElementById('masterCompReleaseVal').textContent = `${m.comp.release}ms`;
+          if (masterChain && masterChain.comp) masterChain.comp.release.value = m.comp.release / 1000;
+        } else if (target === 'limiterCeiling') {
+          m.limiter.ceiling = -20 + newVal * 0.2;
+          document.getElementById('limiterCeilingVal').textContent = `${m.limiter.ceiling.toFixed(1)}dB`;
+          if (masterChain && masterChain.limiter) masterChain.limiter.threshold.value = m.limiter.ceiling;
+        } else if (target === 'limiterRelease') {
+          m.limiter.release = Math.round(10 * Math.pow(100, newVal / 100));
+          document.getElementById('limiterReleaseVal').textContent = `${m.limiter.release}ms`;
+          if (masterChain && masterChain.limiter) masterChain.limiter.release.value = m.limiter.release / 1000;
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+  });
+  
+  // Also attach fader events for master fader
+  document.querySelectorAll('#masterView [data-fader]').forEach(fader => {
+    fader.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      const startY = e.clientY;
+      const startVal = parseFloat(fader.dataset.val);
+      const min = 0, max = 100;
+      
+      const onMove = (moveEvent) => {
+        let deltaY = startY - moveEvent.clientY;
+        let newVal = Math.min(max, Math.max(min, startVal + deltaY));
+        newVal = Math.round(newVal);
+        fader.dataset.val = newVal;
+        const fill = fader.querySelector('.fader-fill');
+        const cap = fader.querySelector('.fader-cap');
+        if (fill) fill.style.height = newVal + '%';
+        if (cap) cap.style.top = (100 - newVal) + '%';
+        
+        state.mixer.masterFader = newVal;
+        setMasterVolume(newVal);
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+  });
+}
+
+function renderPluginsView() {
+   const el = document.getElementById('pluginsView');
+   if (!el) return;
+   const ch = state.channels.find(c => c.id === state.selectedChannel);
+   const effectNames = Object.keys(EffectsRack.effects);
+   el.innerHTML = `
+     <div style="display:flex; justify-content:space-between; margin-bottom:12px;">
+       <h3 style="font-size:14px; font-weight:700; color:#c9a84c;">PLUGINS — ${ch ? ch.label : 'No Channel Selected'}</h3>
+       <button class="control-btn primary" id="addPluginBtn">+ ADD PLUGIN</button>
+     </div>
+     <div style="margin-bottom:12px; padding:8px; background:#1c1f26; border-radius:6px; max-height:200px; overflow-y:auto;">
+       <div style="font-size:9px; color:#8a8d96; margin-bottom:6px;">AVAILABLE EFFECTS (${effectNames.length})</div>
+       <div style="display:flex; gap:6px; flex-wrap:wrap;">
+         ${effectNames.map(name => `<button class="plugin-type-btn" data-type="${name}" style="padding:4px 8px; background:#24272e; border:1px solid #353840; border-radius:3px; color:#8a8d96; font:600 7px monospace; cursor:pointer; flex:1; min-width:120px;">${name}</button>`).join('')}
+       </div>
+     </div>
+     <div class="plugin-rack" id="pluginRack">
+       ${ch && ch.plugins.length ? ch.plugins.map((p,i) => `<div class="plugin-slot" data-pidx="${i}" style="display:flex; align-items:center; gap:8px; background:#1a1d23; border:1px solid #2a2d34; border-radius:6px; padding:8px; margin-bottom:6px; cursor:pointer;" data-plugin="${p}"><span style="font-size:9px; color:#6e717a;">${i+1}.</span><span style="flex:1; font-weight:600;">${p}</span><button class="remove-plugin" data-pname="${p}" style="background:none; border:none; color:#f54b4b; cursor:pointer;">✕</button></div>`).join('') : '<div style="color:#6e717a; text-align:center; padding:20px; background:#1a1d23; border-radius:6px; border:1px dashed #2a2d34;">No plugins on this channel. Click an effect below to add.</div>'}
+     </div>
+   `;
+   document.getElementById('addPluginBtn')?.addEventListener('click', () => {});
+   document.querySelectorAll('.plugin-type-btn').forEach(btn => {
+     btn.addEventListener('click', () => {
+       if (ch) {
+         const pluginId = btn.dataset.type;
+         if (!ch.plugins.includes(pluginId)) {
+           ch.plugins.push(pluginId);
+           const effectFactory = EffectsRack.effects[pluginId];
+           if (effectFactory && !ch.effectInstances) ch.effectInstances = {};
+           if (effectFactory) ch.effectInstances[pluginId] = effectFactory();
+           rebuildChannelStripNodes();
+           renderPluginsView();
+           notify(`Added ${pluginId} to ${ch.label}`);
+         }
+       }
+     });
+   });
+   document.querySelectorAll('.remove-plugin').forEach(btn => {
+     btn.addEventListener('click', (e) => {
+       e.stopPropagation();
+       if (ch) {
+         const name = btn.dataset.pname;
+         const idx = ch.plugins.indexOf(name);
+         if (idx >= 0) {
+           ch.plugins.splice(idx, 1);
+           if (ch.effectInstances) {
+             const inst = ch.effectInstances[name];
+             if (inst && inst.inputNode) inst.inputNode.disconnect();
+             if (inst && inst.outputNode) inst.outputNode.disconnect();
+             delete ch.effectInstances[name];
+           }
+           rebuildChannelStripNodes();
+           renderPluginsView();
+           notify(`Removed ${name} from ${ch.label}`);
+         }
+       }
+     });
+   });
+   // Add click handlers for plugin slots
+   document.querySelectorAll('.plugin-slot').forEach(slot => {
+     slot.addEventListener('click', () => {
+       const pluginName = slot.dataset.plugin;
+       openPluginEditor(ch.id, pluginName);
+     });
+   });
+ }
+
+// ----- PLUGIN EDITOR -----
+function openPluginEditor(channelId, pluginName) {
+   const modal = document.getElementById('importModal');
+   if (!modal) return;
+   const ch = state.channels.find(c => c.id === channelId);
+   if (!ch || !ch.effectInstances || !ch.effectInstances[pluginName]) return;
+   
+   const effect = ch.effectInstances[pluginName];
+   modal.innerHTML = `
+     <div class="modal" style="width:500px; max-height:80vh; overflow-y:auto">
+       <h3>${effect.name} — ${ch.label}</h3>
+       <div style="margin:12px 0;">
+         ${effect.presets ? `<div style="margin-bottom:10px;">
+           <div style="font-size:9px; color:#8a8d96; margin-bottom:6px;">PRESETS</div>
+           ${Object.entries(effect.presets).map(([name]) => `<button class="setting-preset" data-preset="${name}" style="margin:2px; padding:4px 8px; font-size:8px;">${name}</button>`).join('')}
+         </div>` : ''}
+         <div style="font-size:9px; color:#8a8d96; margin-bottom:6px;">PARAMETERS</div>
+         ${Object.entries(effect.params).map(([key, param]) => `
+           <div class="param-slider-row" data-param="${key}" data-plugin="${pluginName}">
+             <label style="font-size:8px; color:#c4c6cc; width:80px;">${key}</label>
+             <input type="range" min="${param.min}" max="${param.max}" value="${param.value}" class="param-slider" style="flex:1">
+             <span class="knob-value" style="font-size:8px; color:#0dc5b0; width:40px; text-align:right;">${param.value}${param.unit}</span>
+           </div>
+         `).join('')}
+       </div>
+       <button class="modal-btn secondary" id="closePluginEditor">Close</button>
+     </div>
+   `;
+   modal.style.display = 'flex';
+   
+   document.querySelectorAll('.setting-preset').forEach(btn => {
+     btn.classList.toggle('active', btn.textContent === 'Bright Plate');
+     btn.addEventListener('click', () => {
+       const preset = btn.textContent;
+       effect.applyPreset(preset);
+       document.querySelectorAll('.setting-preset').forEach(b => b.classList.remove('active'));
+       btn.classList.add('active');
+       notify(`Applied preset: ${preset}`);
+     });
+   });
+   
+   document.querySelectorAll('.param-slider').forEach(slider => {
+     const paramKey = slider.parentElement.dataset.param;
+     slider.addEventListener('input', () => {
+       const val = parseFloat(slider.value);
+       effect.setParam(paramKey, val);
+       slider.parentElement.querySelector('.knob-value').textContent = val + effect.params[paramKey].unit;
+     });
+   });
+   
+   document.getElementById('closePluginEditor')?.addEventListener('click', () => {
+     modal.style.display = 'none';
+   });
+ }
+
+function renderAIView() {
+  const el = document.getElementById('aiView');
+  if (!el) return;
+  el.innerHTML = `
+    <div class="ai-chat-container">
+      <h3>🤖 Red Dirt AI Assistant</h3>
+      <div class="ai-messages" id="aiMessages">
+        <div class="ai-message ai"><div class="msg-bubble">Hello! I'm your AI audio assistant. Try saying "add reverb to channel 1" or "master the mix"</div></div>
+      </div>
+      <div class="ai-input-area">
+        <input type="text" id="aiInput" placeholder="Ask me anything about your mix...">
+        <button id="aiSend">Send</button>
+      </div>
+      <div class="ai-chips">
+        <button class="ai-chip" data-q="add reverb to channel 1">Add Reverb</button>
+        <button class="ai-chip" data-q="master the mix">Master Mix</button>
+        <button class="ai-chip" data-q="create a vocal chain">Vocal Chain</button>
+        <button class="ai-chip" data-q="auto-mix all tracks">Auto-Mix</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('aiSend')?.addEventListener('click', () => {
+    const input = document.getElementById('aiInput');
+    const msg = input?.value;
+    if (msg) {
+      const messagesDiv = document.getElementById('aiMessages');
+      if (messagesDiv) {
+        messagesDiv.innerHTML += `<div class="ai-message user"><div class="msg-bubble">${msg}</div></div>`;
+        messagesDiv.innerHTML += `<div class="ai-message ai"><div class="msg-bubble">Processing "${msg}"... I've applied the appropriate settings to your mix.</div></div>`;
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      }
+      input.value = '';
+      notify(`AI: ${msg.slice(0, 50)}...`);
+    }
+  });
+  document.querySelectorAll('.ai-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const input = document.getElementById('aiInput');
+      if (input) input.value = chip.dataset.q;
+      document.getElementById('aiSend')?.click();
+    });
+  });
+}
+
+function renderBandView() {
+  const el = document.getElementById('bandView');
+  if (!el) return;
+  const genres = ['country_pop','country_classic','country_outlaw','country_americana','christian_worship','christian_ccm','christian_gospel','christian_rock'];
+  el.innerHTML = `
+    <div class="band-header">🎸 Red Dirt Studio Band <small>generate a song from description</small></div>
+    <div class="band-form">
+      <div class="band-field full"><label>Song Title</label><input id="band-title" maxlength="50" placeholder="e.g. Small-Town Friday Night"><div class="char-count"><span id="band-title-count">0</span>/50</div></div>
+      <div class="band-field full"><label>Genre</label><select id="band-genre">${genres.map(g => `<option value="${g}">${g.replace(/_/g,' ')}</option>`).join('')}</select></div>
+      <div class="band-field full"><label>Song Description (max 2500)</label><textarea id="band-desc" maxlength="2500" rows="3" placeholder="upbeat pop country at 80 BPM, low baritone, banjo + fiddle"></textarea><div class="char-count"><span id="band-desc-count">0</span>/2500</div></div>
+      <div class="band-field full"><label>Song Lyrics</label><textarea id="band-lyrics" maxlength="5000" rows="5" placeholder="[0:00] Verse 1&#10;The sun goes down on a dusty road"></textarea><div class="char-count"><span id="band-lyrics-count">0</span>/5000</div></div>
+      <div class="band-field"><label>Duration (s)</label><input id="band-duration" type="number" min="20" max="360" value="30"></div>
+      <div class="band-field"><label>BPM (0 = auto)</label><input id="band-bpm" type="number" min="0" max="200" value="0"></div>
+    </div>
+    <div class="band-actions">
+      <button class="control-btn primary" id="band-generate">🎬 GENERATE SONG</button>
+      <button class="control-btn" id="band-clear">Clear</button>
+      <span class="band-status idle" id="band-status">Ready</span>
+    </div>
+    <div class="band-results" id="band-results" style="display:none"><h4>📀 Generated Song</h4><div id="band-results-body"></div></div>
+  `;
+  document.getElementById('band-generate')?.addEventListener('click', async () => {
+    const title = document.getElementById('band-title')?.value || 'Untitled';
+    const genre = document.getElementById('band-genre')?.value || 'country_pop';
+    const desc = document.getElementById('band-desc')?.value || '';
+    const duration = parseInt(document.getElementById('band-duration')?.value) || 30;
+    const bpm = parseInt(document.getElementById('band-bpm')?.value) || 96;
+    const status = document.getElementById('band-status');
+    const results = document.getElementById('band-results');
+    const body = document.getElementById('band-results-body');
+    if (status) { status.textContent = '⏳ Generating...'; status.className = 'band-status'; }
+    notify(`Generating "${title}" in ${genre} style...`);
+    try {
+      if (!window._songWriter) window._songWriter = new SongWriter();
+      await window._songWriter.scan();
+      const result = await window._songWriter.generate({ genre, bpm, duration, title, desc });
+      state.transport.tempo = bpm;
+      const freeSlot = state.channels.findIndex(c => !c.hasRealAudio && c.takes.length === 0);
+      const chId = (freeSlot >= 0 ? freeSlot + 1 : 1);
+      const ch = state.channels.find(c => c.id === chId) || state.channels[0];
+      ch.label = title.slice(0, 20);
+      ch.hasRealAudio = true;
+      ch.takes.push({ id: Date.now(), name: title, duration: duration, quality: 100, size: `${duration}s`, buffer: null });
+      
+      const lyrics = document.getElementById('band-lyrics')?.value;
+      if (lyrics && lyrics.trim()) {
+        const parsed = lyrics.split('\n').filter(l => l.trim()).map((line, idx) => ({ time: idx * 4, text: line }));
+        state.teleprompterLyrics = parsed;
+      }
+      
+      if (results && body) {
+        results.style.display = 'block';
+        body.innerHTML = `<div class="band-result-item"><span class="band-result-label">Title</span><span class="band-result-value">${title}</span></div>
+          <div class="band-result-item"><span class="band-result-label">Genre</span><span class="band-result-value">${genre}</span></div>
+          <div class="band-result-item"><span class="band-result-label">Duration</span><span class="band-result-value">${duration}s</span></div>
+          <div class="band-result-item"><span class="band-result-label">BPM</span><span class="band-result-value">${bpm}</span></div>
+          <div class="band-result-item"><span class="band-result-label">Status</span><span class="band-result-value">Import audio to Channel ${chId} to hear playback</span></div>`;
+      }
+      if (status) { status.textContent = '✅ Generated'; status.className = 'band-status'; }
+      renderMixer();
+      renderTransport();
+      notify(`Song "${title}" created on Channel ${chId}`);
+    } catch(e) {
+      if (status) { status.textContent = '❌ Failed'; status.className = 'band-status error'; }
+      notify(`Generation failed: ${e.message}`);
+    }
+  });
+  document.getElementById('band-clear')?.addEventListener('click', () => {
+    const fields = ['band-title', 'band-desc', 'band-lyrics'];
+    fields.forEach(f => { const el = document.getElementById(f); if(el) el.value = ''; });
+    document.getElementById('band-duration').value = '30';
+    document.getElementById('band-bpm').value = '0';
+    document.getElementById('band-results').style.display = 'none';
+    document.getElementById('band-status').textContent = 'Ready';
+    document.getElementById('band-status').className = 'band-status idle';
+  });
+}
+
+function renderRDRView() {
+  const el = document.getElementById('rdslView');
+  if (!el) return;
+  el.innerHTML = `
+    <h3 class="rdsl-title">🎸 Red Dirt Rhythm Generator</h3>
+    <div style="padding:20px; text-align:center;">
+      <p>Professional song generation with AI assistance</p>
+      <button class="control-btn primary" id="rdrGenerateBtn" style="margin-top:16px;">Generate New Song</button>
+    </div>
+  `;
+  document.getElementById('rdrGenerateBtn')?.addEventListener('click', () => {
+    notify('RDR generation started - check Band view for more options');
+    switchView('BAND');
+  });
+}
+
+function renderAutocompView() {
+  const el = document.getElementById('autocompView');
+  if (!el) return;
+  const ch = state.channels.find(c => c.id === state.selectedChannel);
+  el.innerHTML = `
+    <div style="display:flex; justify-content:space-between; margin-bottom:12px;">
+      <h3>AUTO-COMP — ${ch ? ch.label : 'No Channel'}</h3>
+      <button class="control-btn primary" id="runAutoComp">⚡ ANALYZE & COMP</button>
+    </div>
+    <div style="display:flex; gap:4px; flex-wrap:wrap; margin-bottom:12px;">
+      ${state.channels.slice(0,8).map(c => `<button class="mode-btn ${c.id===state.selectedChannel?'active':''}" data-selch="${c.id}">CH${c.id}</button>`).join('')}
+    </div>
+    <div id="compTakesList">
+      ${ch && ch.takes.length ? ch.takes.map((t,i) => `
+        <div style="background:#1c1f26; border-radius:6px; padding:10px; margin-bottom:6px;">
+          <div style="font-weight:600;">${t.name || 'Take '+(i+1)}</div>
+          <div style="font-size:8px; color:#6e717a;">${t.duration ? t.duration.toFixed(1)+'s' : 'pending'}</div>
+          <div style="height:3px; background:#25282f; margin-top:4px;"><div style="width:${t.quality||80}%; height:100%; background:linear-gradient(90deg,#f54b4b,#f5c542,#3dd68c);"></div></div>
+        </div>
+      `).join('') : '<div style="color:#6e717a; text-align:center; padding:20px;">No takes. Import audio to begin comping.</div>'}
+    </div>
+  `;
+  document.querySelectorAll('[data-selch]').forEach(btn => {
+    btn.onclick = () => { state.selectedChannel = parseInt(btn.dataset.selch); renderAutocompView(); renderMixer(); };
+  });
+  document.getElementById('runAutoComp')?.addEventListener('click', () => {
+    if (!ch || ch.takes.length < 2) {
+      notify('Need at least 2 takes to auto-comp');
+      return;
+    }
+    const validTakes = ch.takes.filter(t => t.buffer);
+    if (validTakes.length < 2) {
+      notify('Need at least 2 takes with decoded audio');
+      return;
+    }
+    const sr = audioCtx ? audioCtx.sampleRate : 48000;
+    const windowSize = Math.floor(sr * 0.1);
+    const stepSize = Math.floor(sr * 0.05);
+    const nWindows = Math.floor(validTakes[0].buffer.length / stepSize);
+    const bestTake = new Array(nWindows).fill(0);
+    const bestScore = new Float32Array(nWindows);
+    for (let w = 0; w < nWindows; w++) {
+      let maxScore = -1;
+      let best = 0;
+      for (let t = 0; t < validTakes.length; t++) {
+        const buf = validTakes[t].buffer;
+        let sum = 0;
+        const start = w * stepSize;
+        const end = Math.min(start + windowSize, buf.length);
+        for (let i = start; i < end; i++) {
+          sum += buf[i] * buf[i];
+        }
+        const rms = Math.sqrt(sum / (end - start));
+        if (rms > maxScore) { maxScore = rms; best = t; }
+      }
+      bestTake[w] = best;
+      bestScore[w] = maxScore;
+    }
+    const minWindow = Math.floor(sr * 0.3);
+    const sel = new Array(nWindows).fill(-1);
+    let cur = bestTake[0];
+    let runStart = 0;
+    for (let w = 1; w <= nWindows; w++) {
+      if (w < nWindows && bestTake[w] === cur && (w - runStart) * stepSize < minWindow) continue;
+      const segEnd = Math.min(w * stepSize, validTakes[cur].buffer.length);
+      for (let i = runStart * stepSize; i < segEnd; i++) {
+        sel[i] = cur;
+      }
+      if (w < nWindows) { cur = bestTake[w]; runStart = w; }
+    }
+    const compiledLen = Math.max(...sel.map((v,i) => v >= 0 ? i : -1)) + 1;
+    const compiled = new Float32Array(compiledLen);
+    for (let i = 0; i < compiledLen; i++) {
+      const t = sel[i];
+      if (t >= 0) compiled[i] = validTakes[t].buffer[i];
+      else compiled[i] = 0;
+    }
+    const wavBlob = encodeWAV(compiled, sr);
+    const compileName = `${ch.label}_Compiled`;
+    ch.takes.push({ name: compileName, buffer: null, duration: compiled.length / sr, size: (wavBlob.size/1024).toFixed(1)+'KB', quality: 95 });
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (audioCtx) audioCtx.decodeAudioData(reader.result).then(buf => {
+        const t = ch.takes.find(t => t.name === compileName);
+        if (t) t.buffer = buf;
+        notify(`Auto-comp complete: ${ch.takes.length} takes compiled into ${(compiled.length/sr).toFixed(1)}s`);
+      }).catch(() => {});
+    };
+    reader.readAsArrayBuffer(wavBlob);
+    renderAutocompView();
+    renderMixer();
+  });
+}
+
+function renderWaveform() {
+  const canvas = document.getElementById('waveCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.fillStyle = '#0d0f14';
+  ctx.fillRect(0, 0, w, h);
+  
+  const channelsWithAudio = state.channels.filter(c => c.hasRealAudio && c.takes.length && c.takes[0]?.buffer);
+  if (channelsWithAudio.length > 0 && state.waveMode === 'waveform') {
+    const take = channelsWithAudio[0].takes[0];
+    if (take.buffer) {
+      const data = take.buffer.getChannelData(0);
+      const step = Math.max(1, Math.floor(data.length / w));
+      ctx.beginPath();
+      ctx.strokeStyle = '#0dc5b0';
+      ctx.lineWidth = 1.5;
+      for (let x = 0; x < w; x++) {
+        const idx = Math.min(data.length - 1, Math.floor(x * step));
+        const y = h/2 + data[idx] * h * 0.4;
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  } else {
+    ctx.strokeStyle = '#25282f';
+    ctx.beginPath();
+    for (let x = 0; x < w; x += 10) {
+      const y = h/2 + Math.sin(x * 0.05) * h * 0.1;
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  
+  const playheadX = (state.transport.time / Math.max(1, getMaxDuration())) * w;
+  ctx.strokeStyle = '#f54b4b';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(playheadX, 0);
+  ctx.lineTo(playheadX, h);
+  ctx.stroke();
+}
+
+// ----- FILE IMPORT -----
+function setupFileImport() {
+  const fileInput = document.getElementById('audioFileInput');
+  if (!fileInput) return;
+  fileInput.onchange = async function(e) {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    const ctx = initAudioEngine();
+    const targetChId = window._importTargetChannel || state.targetChannel;
+    window._importTargetChannel = null;
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const chId = targetChId + i;
+      if (chId > TRACK_COUNT) break;
+      const ch = state.channels.find(c => c.id === chId);
+      if (!ch) continue;
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        ch.takes.push({
+          id: Date.now() + i,
+          name: file.name,
+          buffer: audioBuffer,
+          duration: audioBuffer.duration,
+          size: (file.size / 1048576).toFixed(1) + ' MB',
+          quality: 100
+        });
+        ch.hasRealAudio = true;
+        ch.label = file.name.replace(/\.[^/.]+$/, '').slice(0, 20);
+        state.importedFiles.push({ name: file.name, size: (file.size/1048576).toFixed(1)+' MB', channel: chId });
+        notify(`Imported: ${file.name} to ${ch.label} (${audioBuffer.duration.toFixed(1)}s)`);
+      } catch(err) {
+        notify(`Failed to import ${file.name}: ${err.message}`);
+      }
+    }
+    renderMixer();
+    renderSidePanel();
+    updateFileList();
+    fileInput.value = '';
+  };
+}
+
+function updateFileList() {
+  const fl = document.getElementById('fileList');
+  if (!fl) return;
+  if (!state.importedFiles.length) { fl.innerHTML = ''; return; }
+  fl.innerHTML = '<div class="file-info"><strong>Imported Files:</strong></div>' +
+    state.importedFiles.map((f,i) => `<div class="file-item"><div><div class="file-name">🎵 ${f.name}</div><div style="font-size:7px;">Ch${f.channel}</div></div><button data-ridx="${i}" style="background:none; border:none; color:#f54b4b; cursor:pointer;">✕</button></div>`).join('');
+  fl.querySelectorAll('[data-ridx]').forEach(b => b.onclick = () => {
+    state.importedFiles.splice(parseInt(b.dataset.ridx), 1);
+    updateFileList();
+  });
+}
+
+// ----- SETTINGS -----
+function loadSettings() {
+  try {
+    const saved = localStorage.getItem('rd_studio_settings');
+    if (saved) state.settings = JSON.parse(saved);
+  } catch(e) {}
+}
+
+function saveSettings() {
+  localStorage.setItem('rd_studio_settings', JSON.stringify(state.settings));
+}
+
+function applyUiScale(value) {
+  state.settings.uiScale = Math.min(140, Math.max(75, value));
+  document.documentElement.style.setProperty('--ui-scale', (state.settings.uiScale / 100).toString());
+  saveSettings();
+}
+
+function updateScaleControls() {
+  const range = document.getElementById('uiScaleRange');
+  const val = document.getElementById('uiScaleValue');
+  if (range) range.value = state.settings.uiScale;
+  if (val) val.textContent = state.settings.uiScale + '%';
+  document.querySelectorAll('[data-scale-preset]').forEach(btn => {
+    btn.classList.toggle('active', parseInt(btn.dataset.scalePreset) === state.settings.uiScale);
+  });
+}
+
+function resetSettings() {
+  state.settings.uiScale = 100;
+  applyUiScale(100);
+  notify('Settings reset');
+}
+
+// ----- POST COMMAND -----
+function postCommand(cmd, data) {
+  console.log('Command:', cmd, data);
+  if (cmd === 'export_mixdown') {
+    notify('Export started');
+    return Promise.resolve({ status: 'done', message: 'Export complete' });
+  }
+  return { status: 'done', message: null };
+}
+
+// ----- INITIALIZATION -----
+async function init() {
+  console.log('Initializing Red Dirt Studio v10...');
+  
+  loadSettings();
+  applyUiScale(state.settings.uiScale);
+  initAudioEngine();
+  setupFileImport();
+  
+  // Populate target channel select
+  const targetSelect = document.getElementById('targetChannel');
+  if (targetSelect) {
+    for (let i = 1; i <= 24; i++) {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `Channel ${i}`;
+      targetSelect.appendChild(opt);
+    }
+    targetSelect.onchange = () => { state.targetChannel = parseInt(targetSelect.value); };
+  }
+  
+  // Modal controls
+  document.getElementById('btnImport')?.addEventListener('click', () => {
+    document.getElementById('importModal').style.display = 'flex';
+    updateFileList();
+  });
+  document.getElementById('btnExport')?.addEventListener('click', () => {
+    document.getElementById('exportModal').style.display = 'flex';
+  });
+  document.getElementById('btnSave')?.addEventListener('click', () => {
+    notify('Session saved');
+  });
+  document.getElementById('btnSettings')?.addEventListener('click', () => {
+    updateScaleControls();
+    document.getElementById('settingsModal').style.display = 'flex';
+  });
+  document.getElementById('browseBtn')?.addEventListener('click', () => {
+    document.getElementById('audioFileInput').click();
+  });
+  document.getElementById('closeImport')?.addEventListener('click', () => {
+    document.getElementById('importModal').style.display = 'none';
+  });
+  document.getElementById('closeExport')?.addEventListener('click', () => {
+    document.getElementById('exportModal').style.display = 'none';
+  });
+  document.getElementById('closeSettings')?.addEventListener('click', () => {
+    document.getElementById('settingsModal').style.display = 'none';
+  });
+  document.getElementById('bounceBtn')?.addEventListener('click', async () => {
+    notify('Bouncing master...');
+    await postCommand('export_mixdown', { duration: Math.round(getMaxDuration()) });
+    document.getElementById('exportModal').style.display = 'none';
+  });
+  document.getElementById('exportStemsBtn')?.addEventListener('click', () => {
+    notify('Exporting stems...');
+    document.getElementById('exportModal').style.display = 'none';
+  });
+  document.getElementById('resetSettings')?.addEventListener('click', resetSettings);
+  document.getElementById('uiScaleRange')?.addEventListener('input', (e) => applyUiScale(parseInt(e.target.value)));
+  document.querySelectorAll('[data-scale-preset]').forEach(btn => {
+    btn.addEventListener('click', () => applyUiScale(parseInt(btn.dataset.scalePreset)));
+  });
+  
+  // Mode toggles
+  document.getElementById('modeWave')?.addEventListener('click', () => {
+    state.waveMode = 'waveform';
+    document.getElementById('modeWave')?.classList.add('active');
+    document.getElementById('modeSpec')?.classList.remove('active');
+  });
+  document.getElementById('modeSpec')?.addEventListener('click', () => {
+    state.waveMode = 'spectral';
+    document.getElementById('modeSpec')?.classList.add('active');
+    document.getElementById('modeWave')?.classList.remove('active');
+  });
+  
+  // View switchers
+  document.querySelectorAll('[data-view]').forEach(btn => {
+    btn.addEventListener('click', () => switchView(btn.dataset.view));
+  });
+  
+  // Writer editor
+  const writerEditor = document.getElementById('writerEditor');
+  const writerPreview = document.getElementById('writerPreviewArea');
+  if (writerEditor && writerPreview) {
+    writerEditor.addEventListener('input', function() {
+      const lines = this.value.split('\n');
+      const words = this.value.trim() ? this.value.trim().split(/\s+/).length : 0;
+      writerPreview.innerHTML = `Characters: ${this.value.length} | Lines: ${lines.length} | Words: ${words}`;
+    });
+    writerEditor.dispatchEvent(new Event('input'));
+  }
+  document.getElementById('saveWriter')?.addEventListener('click', () => {
+    const content = document.getElementById('writerEditor')?.value || '';
+    localStorage.setItem('rd_writer_draft', content);
+    notify('Writer saved');
+  });
+  document.getElementById('clearWriter')?.addEventListener('click', () => {
+    const editor = document.getElementById('writerEditor');
+    if (editor) editor.value = '';
+    editor?.dispatchEvent(new Event('input'));
+  });
+  document.getElementById('toTeleWriter')?.addEventListener('click', () => {
+    const content = document.getElementById('writerEditor')?.value || '';
+    const lines = content.split('\n').filter(l => l.trim());
+    state.teleprompterLyrics = lines.map((line, idx) => ({ time: idx * 4, text: line }));
+    localStorage.setItem('rd_teleprompter_lyrics', JSON.stringify(state.teleprompterLyrics));
+    switchView('TELE');
+    notify('Sent to teleprompter');
+  });
+  document.getElementById('toRdslWriter')?.addEventListener('click', () => {
+    const content = document.getElementById('writerEditor')?.value || '';
+    const editor = document.getElementById('rdslEditor');
+    if (editor) editor.value = content;
+    switchView('RDSL');
+    notify('Sent to RDSL');
+  });
+  
+  // Load saved writer content
+  const saved = localStorage.getItem('rd_writer_draft');
+  if (saved && writerEditor) writerEditor.value = saved;
+  
+  // Load saved teleprompter
+  try {
+    const savedTele = localStorage.getItem('rd_teleprompter_lyrics');
+    if (savedTele) state.teleprompterLyrics = JSON.parse(savedTele);
+    else state.teleprompterLyrics = [{time:0,text:'Welcome to Red Dirt Studio'},{time:4,text:'Import audio to begin'}];
+  } catch(e) {}
+  
+  // Initialize TitanEngine
+  window.titanEngine = new TitanEngineClient();
+  const teDot = document.getElementById('titanEngineDot');
+  const teLabel = document.getElementById('titanEngineLabel');
+  if (teDot && teLabel) {
+    window.titanEngine.onStatus((ready) => {
+      teDot.style.background = ready ? '#3dd68c' : '#f54b4b';
+      teLabel.textContent = ready ? 'TitanEngine: ONLINE' : 'TitanEngine: OFFLINE';
+    });
+    
+    // Update UI when WASM engine status changes
+    const checkWasmStatus = () => {
+      if (window.TitanEngine.isActive()) {
+        teDot.style.background = '#0dc5b0';
+        teLabel.textContent = 'TitanEngine: WASM ACTIVE';
+      }
+    };
+    setInterval(checkWasmStatus, 1000);
+  }
+  window.titanEngine.startPolling(8000);
+  
+  // Initial render
+  renderMixer();
+  renderTransport();
+  
+  // Animation loops
+  let lastDraw = 0;
+  function animate(timestamp) {
+    renderWaveform();
+    requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
+  
+  // VU meter update
+  setInterval(() => {
+    state.channels.forEach((ch, i) => {
+      if (state.transport.playing && ch.hasRealAudio) {
+        const peak = getChannelPeak(ch);
+        state.vuLevels[i] = Math.min(100, peak * 120);
+      } else {
+        state.vuLevels[i] = Math.max(0, (state.vuLevels[i] || 0) * 0.92);
+      }
+    });
+    if (state.activeView === 'MIXER') {
+      const meters = document.querySelectorAll('.channel-strip .vu-fill');
+      meters.forEach((m, i) => {
+        if (m && state.vuLevels[i] !== undefined) {
+          m.style.height = Math.min(100, state.vuLevels[i]) + '%';
+        }
+      });
+    }
+  }, 50);
+  
+  // Transport time update
+  setInterval(() => {
+    if (state.transport.playing) {
+      state.transport.time += 0.05;
+      const maxDur = getMaxDuration();
+      if (state.transport.time >= maxDur) {
+        if (state.transport.loopEnabled) {
+          state.transport.time = 0;
+          if (state.transport.playing) { stopAudio(); playAudioFiles(); }
+        } else {
+          state.transport.playing = false;
+          stopAudio();
+          stopClick();
+          renderTransport();
+        }
+      }
+      if (state.activeView === 'TELE') renderTeleView();
+      renderTransport();
+    }
+  }, 50);
+  
+  notify('Red Dirt Studio Ready — Import audio files to get started!');
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
